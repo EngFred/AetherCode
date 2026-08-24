@@ -3,6 +3,8 @@ venv/
 .venv/
 env/
 
+node_modules/
+
 # Secrets & API Keys
 .env
 settings.json
