@@ -17,6 +17,12 @@ type Message = {
   approved?: boolean;
 };
 
+// Extends the native WebSocket with a per-instance flag, so an intentional
+// close (e.g. Strict Mode's mount/cleanup/mount) can be traced back to the
+// exact socket it belongs to instead of a single shared ref that a newer
+// connect() call could reset out from under an older socket's pending error.
+type TrackedWebSocket = WebSocket & { _intentionalClose?: boolean };
+
 const WS_URL = 'ws://localhost:8000/ws/chat';
 
 export default function Home() {
@@ -28,7 +34,7 @@ export default function Home() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
 
-  const wsRef = useRef<WebSocket | null>(null);
+  const wsRef = useRef<TrackedWebSocket | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -42,7 +48,8 @@ export default function Home() {
   // as this socket stays open, the agent instance (and its chat_history)
   // stays alive too.
   const connect = useCallback(() => {
-    const ws = new WebSocket(WS_URL);
+    const ws: TrackedWebSocket = new WebSocket(WS_URL);
+    ws._intentionalClose = false;
 
     ws.onopen = () => setIsConnected(true);
 
@@ -66,6 +73,10 @@ export default function Home() {
     };
 
     ws.onerror = () => {
+      // Only this socket's own close intent matters — a later connect()
+      // opening a fresh socket must not be able to mask (or unmask) this one.
+      if (ws._intentionalClose) return;
+
       setMessages((prev) => [...prev, { role: 'system', text: '❌ Connection to API failed.' }]);
       setIsRunning(false);
     };
@@ -80,7 +91,10 @@ export default function Home() {
 
   useEffect(() => {
     connect();
-    return () => wsRef.current?.close();
+    return () => {
+      if (wsRef.current) wsRef.current._intentionalClose = true;
+      wsRef.current?.close();
+    };
   }, [connect]);
 
   const respondToApproval = (id: string, approved: boolean) => {
