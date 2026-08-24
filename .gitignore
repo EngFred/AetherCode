@@ -1,0 +1,23 @@
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Secrets & API Keys
+.env
+settings.json
+
+# Python Cache & Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Agent Backups
+.aether_backups/
+
+# IDE & System Files
+.vscode/
+.idea/
+.DS_Store
+*.log

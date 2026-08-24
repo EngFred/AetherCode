@@ -1,0 +1,33 @@
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Automatically load secrets from .env file
+load_dotenv()
+
+# --- API KEYS ---
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "PLACEHOLDER_GROQ_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "PLACEHOLDER_GEMINI_KEY")
+
+# --- MODEL DEFINITIONS ---
+GROQ_EXECUTOR_MODEL = "llama-3.3-70b-versatile"
+GEMINI_ANALYZER_MODEL = "gemini-2.5-flash"
+
+# --- FILE SYSTEM SAFETY CONFIGURATION ---
+IGNORED_DIRECTORIES = {
+    "node_modules",
+    ".git",
+    "venv",
+    ".venv",
+    "__pycache__",
+    ".idea",
+    ".vscode",
+    "dist",
+    "build",
+    "coverage"
+}
+
+ALLOWED_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".html", ".css", 
+    ".json", ".md", ".env", ".yaml", ".yml", ".sql", ".sh"
+}
