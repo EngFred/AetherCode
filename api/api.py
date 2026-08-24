@@ -79,6 +79,12 @@ async def chat_endpoint(websocket: WebSocket):
                     fut.set_result(approved)
                 continue
 
+            if data.get("type") == "clear_history":
+                if agent is not None:
+                    agent.reset_history()
+                await websocket.send_json({"role": "system", "text": "🧹 New chat started — previous context cleared."})
+                continue
+
             user_prompt = data.get("prompt")
             working_dir = data.get("working_dir")
             execution_mode = data.get("execution_mode", "auto")

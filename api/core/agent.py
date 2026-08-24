@@ -6,6 +6,7 @@ from tools.path_utils import find_referenced_files
 from providers.gemini_provider import GeminiAnalyzerProvider
 from providers.groq_provider import GroqExecutorProvider
 from core.prompt_builder import PromptBuilder
+import config
 
 
 class AetherAgent:
@@ -18,6 +19,16 @@ class AetherAgent:
         # so caching the tree here is safe and saves a full filesystem walk on
         # every follow-up message.
         self._tree_cache: Optional[str] = None
+
+        # --- Session memory ---
+        # Persists for as long as this instance lives (i.e. one working
+        # directory / one connection — see api.py). Cleared automatically on
+        # a project switch, or on demand via reset_history().
+        self.chat_history: List[Dict[str, str]] = []
+        # Filenames (not content) touched this session, most-recent-last.
+        # Lets a vague follow-up ("fix the bug in it") get resolved without
+        # re-sending file content or re-running a full Gemini scan.
+        self._recent_files: List[str] = []
 
     def get_tool_definitions(self) -> list[Dict[str, Any]]:
         return [
@@ -55,8 +66,18 @@ class AetherAgent:
             }
         ]
 
+    def _track_recent_file(self, relative_path: str):
+        if relative_path in self._recent_files:
+            self._recent_files.remove(relative_path)
+        self._recent_files.append(relative_path)
+        if len(self._recent_files) > config.MAX_RECENT_FILES_TRACKED:
+            self._recent_files.pop(0)
+
     def _execute_tool(self, tool_name: str, args: Dict[str, Any], command_approval_callback: Optional[Callable[[str], bool]] = None) -> str:
         rel_path = args.get("relative_path", "")
+        if tool_name in ("read_file", "write_file", "delete_file") and rel_path:
+            self._track_recent_file(rel_path)
+
         if tool_name == "read_file":
             return self.file_manager.read_file(rel_path)
         elif tool_name == "write_file":
@@ -78,6 +99,46 @@ class AetherAgent:
         if self._tree_cache is None:
             self._tree_cache = generate_directory_tree(self.root_dir)
         return self._tree_cache
+
+    def _get_history_window(self) -> List[Dict[str, str]]:
+        """
+        Bounded slice of chat_history to prepend to the next call — bounded
+        by turn count AND a rough character budget, so a long session never
+        silently balloons the request (and your daily token quota) forever.
+        Oldest turns drop first, in (user, assistant) pairs.
+        """
+        if not self.chat_history:
+            return []
+
+        window = self.chat_history[-(config.MAX_CHAT_HISTORY_TURNS * 2):]
+
+        total_chars = sum(len(m["content"]) for m in window)
+        while len(window) > 2 and total_chars > config.MAX_CHAT_HISTORY_CHARS:
+            removed_pair = window[:2]
+            window = window[2:]
+            total_chars -= sum(len(m["content"]) for m in removed_pair)
+
+        return window
+
+    def _append_turn(self, user_prompt: str, assistant_answer: str):
+        """Persists one (user, assistant) exchange. Infra errors are skipped
+        so a Groq/Gemini hiccup doesn't end up in the model's own memory."""
+        if assistant_answer.startswith("Groq API Error:"):
+            return
+        self.chat_history.append({"role": "user", "content": user_prompt})
+        self.chat_history.append({"role": "assistant", "content": assistant_answer})
+        # Belt-and-braces ceiling above the normal window size, so the raw
+        # list itself can't grow unbounded across a very long-lived connection.
+        hard_cap = config.MAX_CHAT_HISTORY_TURNS * 4
+        if len(self.chat_history) > hard_cap:
+            self.chat_history = self.chat_history[-hard_cap:]
+
+    def reset_history(self) -> str:
+        """Forgets the conversation (e.g. user clicked 'New Chat'). File
+        backups / undo stack are untouched — this only clears memory."""
+        self.chat_history = []
+        self._recent_files = []
+        return "Conversation memory cleared."
 
     def _run_groq_tool_loop(
         self,
@@ -140,8 +201,18 @@ class AetherAgent:
         if is_general_chat:
             log_callback("system", "⚡ General Chat Mode: Bypassing file scan...")
             messages = [
-                {"role": "system", "content": "You are AetherAgent, an AI coding assistant. The user is in general chat mode. No project folder is active."},
-                {"role": "user", "content": user_prompt}
+                {
+                    "role": "system",
+                    "content": (
+                        "You are AetherAgent, a helpful AI coding assistant chatting with the "
+                        "user in general chat mode (no project folder is currently linked). "
+                        "This is a continuous conversation — use the earlier turns below to "
+                        "understand context, references like 'it' or 'that', and anything the "
+                        "user already told you, without asking them to repeat themselves."
+                    ),
+                },
+                *self._get_history_window(),
+                {"role": "user", "content": user_prompt},
             ]
             try:
                 response_msg = self.groq_provider.client.chat.completions.create(
@@ -151,6 +222,7 @@ class AetherAgent:
                 ).choices[0].message
                 final_answer = response_msg.content or "No response generated."
                 log_callback("ai", final_answer)
+                self._append_turn(user_prompt, final_answer)
                 return final_answer
             except Exception as e:
                 err = f"Groq API Error: {str(e)}"
@@ -163,8 +235,16 @@ class AetherAgent:
         referenced_files: List[Tuple[str, str]] = []
         if execution_mode in ("auto", "direct"):
             referenced_files = find_referenced_files(user_prompt, self.file_manager)
+            for path, _ in referenced_files:
+                self._track_recent_file(path)
 
-        use_deep_scan = execution_mode == "deep" or (execution_mode == "auto" and not referenced_files)
+        # In Auto mode, skip the full Gemini scan not just when the prompt
+        # names a file, but also when we already have file context from
+        # earlier in this session — a bare "now fix the bug in it" shouldn't
+        # trigger a whole new project scan when we just read that file.
+        use_deep_scan = execution_mode == "deep" or (
+            execution_mode == "auto" and not referenced_files and not self._recent_files
+        )
 
         if use_deep_scan:
             log_callback("system", "🔍 Phase 1: Scanning project directory with Gemini...")
@@ -178,7 +258,12 @@ class AetherAgent:
 
             user_content = f"User Request: {user_prompt}\n\nGemini Diagnosis:\n{gemini_analysis}"
         else:
-            reason = "Instant mode is selected" if execution_mode == "direct" else "explicit file reference(s) were detected in your message"
+            if execution_mode == "direct":
+                reason = "Instant mode is selected"
+            elif referenced_files:
+                reason = "explicit file reference(s) were detected in your message"
+            else:
+                reason = "using file context from earlier in this session"
             log_callback("system", f"⚡ Skipping directory scan — {reason}. Handing straight to Groq...")
 
             if referenced_files:
@@ -191,9 +276,20 @@ class AetherAgent:
             else:
                 user_content = f"User Request: {user_prompt}"
 
+        if self._recent_files:
+            recent_list = ", ".join(self._recent_files)
+            user_content += (
+                f"\n\n(Files touched earlier this session, most recent last: {recent_list}. "
+                f"If the request refers to one of these without naming it, call read_file on "
+                f"the right one rather than asking the user which file they mean.)"
+            )
+
         messages = [
             {"role": "system", "content": PromptBuilder.get_groq_system_instruction()},
+            *self._get_history_window(),
             {"role": "user", "content": user_content}
         ]
 
-        return self._run_groq_tool_loop(messages, tools, log_callback, command_approval_callback)
+        final_answer = self._run_groq_tool_loop(messages, tools, log_callback, command_approval_callback)
+        self._append_turn(user_prompt, final_answer)
+        return final_answer

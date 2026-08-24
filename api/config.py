@@ -38,3 +38,10 @@ ALLOWED_EXTENSIONS = {
 # --- SMART ROUTING (Auto mode) ---
 MAX_REFERENCED_FILES = 5
 MAX_REFERENCED_FILE_CHARS = 12000
+
+# --- CONVERSATION MEMORY ---
+# Keeps follow-up messages actually continuous, while keeping every call
+# token-frugal enough not to eat into free-tier daily limits.
+MAX_CHAT_HISTORY_TURNS = 12       # how many past (user, assistant) exchanges to resend per call
+MAX_CHAT_HISTORY_CHARS = 16000    # rough char budget for that history block; oldest turns drop first
+MAX_RECENT_FILES_TRACKED = 8      # filenames (not content) carried forward across turns this session

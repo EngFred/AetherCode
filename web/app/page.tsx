@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Check, Command, Cpu, Menu, Sparkles, User, X as XIcon } from 'lucide-react';
+import { Check, Command, Cpu, Menu, MessageSquarePlus, Sparkles, User, X as XIcon } from 'lucide-react';
 import Sidebar from '@/components/Sidebar';
 import ChatInput from '@/components/ChatInput';
 import MarkdownMessage from '@/components/MarkdownMessage';
@@ -37,7 +37,10 @@ export default function Home() {
 
   // Single persistent connection for the whole session, instead of a new
   // socket per message — needed so mid-task approval prompts round-trip on
-  // the same connection, and so we're not leaking sockets.
+  // the same connection, and so we're not leaking sockets. It's also what
+  // lets the backend's AetherAgent hold real conversation memory: as long
+  // as this socket stays open, the agent instance (and its chat_history)
+  // stays alive too.
   const connect = useCallback(() => {
     const ws = new WebSocket(WS_URL);
 
@@ -85,6 +88,17 @@ export default function Home() {
     setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, resolved: true, approved } : m)));
   };
 
+  // Clears the backend agent's chat_history (if a session is live) and
+  // wipes the visible transcript. Deliberate reset — everyday follow-ups
+  // no longer need this since the agent now remembers on its own.
+  const startNewChat = () => {
+    if (isRunning) return;
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'clear_history' }));
+    }
+    setMessages([]);
+  };
+
   const sendMessage = () => {
     if (!input.trim() || isRunning) return;
 
@@ -119,6 +133,7 @@ export default function Home() {
           setWorkingDir={setWorkingDir}
           executionMode={executionMode}
           setExecutionMode={setExecutionMode}
+          onNewChat={startNewChat}
         />
       </div>
 
@@ -135,6 +150,7 @@ export default function Home() {
             setWorkingDir={setWorkingDir}
             executionMode={executionMode}
             setExecutionMode={setExecutionMode}
+            onNewChat={startNewChat}
             onClose={() => setIsSidebarOpen(false)}
             showCloseButton
           />
@@ -159,7 +175,15 @@ export default function Home() {
             </div>
             <span className="text-sm font-semibold tracking-tight text-gray-100">AetherCode</span>
           </div>
-          <div className="h-10 w-10" />
+          <button
+            type="button"
+            onClick={startNewChat}
+            disabled={isRunning}
+            aria-label="New chat"
+            className="flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-white/[0.03] text-gray-300 transition hover:bg-white/[0.07] hover:text-white disabled:opacity-40"
+          >
+            <MessageSquarePlus className="h-5 w-5" />
+          </button>
         </header>
 
         <div className="relative z-10 flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden scroll-smooth">

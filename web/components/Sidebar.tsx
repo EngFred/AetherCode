@@ -1,4 +1,4 @@
-import { FolderGit2, Gauge, Settings, Sparkles, Telescope, X, Zap } from 'lucide-react';
+import { FolderGit2, Gauge, MessageSquarePlus, Settings, Sparkles, Telescope, X, Zap } from 'lucide-react';
 
 type ExecutionMode = 'direct' | 'auto' | 'deep';
 
@@ -7,13 +7,14 @@ interface SidebarProps {
   setWorkingDir: (dir: string) => void;
   executionMode: ExecutionMode;
   setExecutionMode: (mode: ExecutionMode) => void;
+  onNewChat: () => void;
   onClose?: () => void;
   showCloseButton?: boolean;
 }
 
 const MODES: { id: ExecutionMode; label: string; description: string; icon: React.ElementType }[] = [
   { id: 'direct', label: 'Instant', description: 'Groq only. Fastest & cheapest — use when you already know the file(s).', icon: Zap },
-  { id: 'auto', label: 'Auto', description: 'Smart routing: skips the scan when your prompt names a file, runs full analysis otherwise.', icon: Gauge },
+  { id: 'auto', label: 'Auto', description: 'Smart routing: skips the scan when your prompt names a file (or you\'re continuing work on one from earlier in this chat); runs full analysis otherwise.', icon: Gauge },
   { id: 'deep', label: 'Deep Scan', description: 'Always scans the full project with Gemini first. Best for broad or unfamiliar changes.', icon: Telescope },
 ];
 
@@ -22,9 +23,15 @@ export default function Sidebar({
   setWorkingDir,
   executionMode,
   setExecutionMode,
+  onNewChat,
   onClose,
   showCloseButton = false,
 }: SidebarProps) {
+  const handleNewChat = () => {
+    onNewChat();
+    if (showCloseButton) onClose?.();
+  };
+
   return (
     <aside className="flex h-full w-72 flex-col justify-between overflow-y-auto border-r border-white/5 bg-[#09090B] p-5 shadow-2xl sm:p-6">
       <div>
@@ -48,6 +55,15 @@ export default function Sidebar({
             </button>
           )}
         </div>
+
+        <button
+          type="button"
+          onClick={handleNewChat}
+          className="mb-8 flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-[#18181B] px-3.5 py-3 text-sm font-medium text-gray-200 shadow-inner transition-all hover:border-indigo-500/40 hover:bg-white/[0.06] hover:text-white sm:mb-10"
+        >
+          <MessageSquarePlus className="h-4 w-4" />
+          New Chat
+        </button>
 
         <div className="space-y-4">
           <label className="flex items-center gap-2 px-2 text-[10px] font-bold uppercase tracking-widest text-gray-500">
