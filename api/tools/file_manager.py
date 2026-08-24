@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+import config
 
 class SafeFileManager:
     """
@@ -18,7 +19,12 @@ class SafeFileManager:
 
     def _resolve_safe_path(self, relative_path: str) -> Path:
         target_path = (self.root_path / relative_path).resolve()
-        if not str(target_path).startswith(str(self.root_path)):
+        # relative_to() raises ValueError if target_path isn't actually inside
+        # root_path — a plain startswith() check would wrongly allow a sibling
+        # directory like "project_evil" when root is "project".
+        try:
+            target_path.relative_to(self.root_path)
+        except ValueError:
             raise PermissionError(f"Access denied: Path '{relative_path}' attempts to leave project root.")
         return target_path
 
@@ -61,11 +67,17 @@ class SafeFileManager:
 
             with open(target_path, "r", encoding="utf-8", errors="replace") as f:
                 return f.read()
+        except PermissionError as e:
+            return f"Error: {str(e)}"
         except Exception as e:
             return f"Error reading file '{relative_path}': {str(e)}"
 
     def write_file(self, relative_path: str, content: str) -> str:
         try:
+            ext = Path(relative_path).suffix
+            if ext and config.ALLOWED_EXTENSIONS and ext not in config.ALLOWED_EXTENSIONS:
+                return f"Error: Writing files with extension '{ext}' is not permitted."
+
             self._create_backup(relative_path)
             target_path = self._resolve_safe_path(relative_path)
             target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -74,6 +86,8 @@ class SafeFileManager:
                 f.write(content)
 
             return f"Successfully saved file: {relative_path}"
+        except PermissionError as e:
+            return f"Error: {str(e)}"
         except Exception as e:
             return f"Error writing to file '{relative_path}': {str(e)}"
 
@@ -86,6 +100,8 @@ class SafeFileManager:
 
             os.remove(target_path)
             return f"Successfully deleted file: {relative_path}"
+        except PermissionError as e:
+            return f"Error: {str(e)}"
         except Exception as e:
             return f"Error deleting file '{relative_path}': {str(e)}"
 

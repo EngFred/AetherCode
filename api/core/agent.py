@@ -1,10 +1,12 @@
 import json
-from typing import Callable, Dict, Any, Optional
+from typing import Callable, Dict, Any, Optional, List, Tuple
 from tools.file_manager import SafeFileManager
 from tools.tree_builder import generate_directory_tree
+from tools.path_utils import find_referenced_files
 from providers.gemini_provider import GeminiAnalyzerProvider
 from providers.groq_provider import GroqExecutorProvider
 from core.prompt_builder import PromptBuilder
+
 
 class AetherAgent:
     def __init__(self, root_dir: str, gemini_key: Optional[str] = None, groq_key: Optional[str] = None):
@@ -12,6 +14,10 @@ class AetherAgent:
         self.file_manager = SafeFileManager(root_dir)
         self.gemini_provider = GeminiAnalyzerProvider(api_key=gemini_key)
         self.groq_provider = GroqExecutorProvider(api_key=groq_key)
+        # One AetherAgent now lives for the whole WebSocket session (see api.py),
+        # so caching the tree here is safe and saves a full filesystem walk on
+        # every follow-up message.
+        self._tree_cache: Optional[str] = None
 
     def get_tool_definitions(self) -> list[Dict[str, Any]]:
         return [
@@ -68,54 +74,20 @@ class AetherAgent:
     def undo(self) -> str:
         return self.file_manager.undo_last_change()
 
-    def run(
-        self, 
-        user_prompt: str, 
+    def _get_directory_tree(self) -> str:
+        if self._tree_cache is None:
+            self._tree_cache = generate_directory_tree(self.root_dir)
+        return self._tree_cache
+
+    def _run_groq_tool_loop(
+        self,
+        messages: list,
+        tools: list,
         log_callback: Callable[[str, str], None],
-        command_approval_callback: Optional[Callable[[str], bool]] = None,
-        is_general_chat: bool = False
+        command_approval_callback: Optional[Callable[[str], bool]],
     ) -> str:
-        
-        # --- GENERAL CHAT BYPASS ---
-        if is_general_chat:
-            log_callback("system", "⚡ General Chat Mode: Bypassing file scan...")
-            messages = [
-                {"role": "system", "content": "You are AetherAgent, an AI coding assistant. The user is in general chat mode. No project folder is active."},
-                {"role": "user", "content": user_prompt}
-            ]
-            try:
-                response_msg = self.groq_provider.client.chat.completions.create(
-                    model=self.groq_provider.model_name,
-                    messages=messages,
-                    temperature=0.6
-                ).choices[0].message
-                final_answer = response_msg.content or "No response generated."
-                log_callback("ai", final_answer)
-                return final_answer
-            except Exception as e:
-                err = f"Groq API Error: {str(e)}"
-                log_callback("system", f"❌ {err}")
-                return err
-
-        # --- STANDARD AGENT PIPELINE ---
-        log_callback("system", "🔍 Phase 1: Scanning project directory with Gemini...")
-        dir_tree = generate_directory_tree(self.root_dir)
-
-        gemini_prompt = PromptBuilder.build_gemini_analysis_prompt(user_prompt, dir_tree)
-        gemini_analysis = self.gemini_provider.generate_response(gemini_prompt)
-
-        # Updated to "ai" role so ReactMarkdown processes headers and formatting properly
-        log_callback("ai", f"📋 **Gemini Diagnosis:**\n\n{gemini_analysis}")
-        log_callback("system", "⚡ Phase 2: Handing over to Groq for tool execution...")
-
-        tools = self.get_tool_definitions()
-        messages = [
-            {"role": "system", "content": PromptBuilder.get_groq_system_instruction()},
-            {"role": "user", "content": f"User Request: {user_prompt}\n\nGemini Diagnosis:\n{gemini_analysis}"}
-        ]
-
         max_turns = 10
-        for turn in range(max_turns):
+        for _ in range(max_turns):
             try:
                 response_msg = self.groq_provider.client.chat.completions.create(
                     model=self.groq_provider.model_name,
@@ -129,7 +101,10 @@ class AetherAgent:
                 log_callback("system", f"❌ {err}")
                 return err
 
-            messages.append(response_msg)
+            # The SDK returns a pydantic model, not a dict. Appending it raw
+            # breaks the next request in this loop (and any retry) — the
+            # OpenAI-compatible client needs plain dicts in `messages`.
+            messages.append(response_msg.model_dump(exclude_none=True))
 
             if response_msg.tool_calls:
                 for tool_call in response_msg.tool_calls:
@@ -150,3 +125,75 @@ class AetherAgent:
                 return final_answer
 
         return "Agent reached maximum tool turns without concluding."
+
+    def run(
+        self,
+        user_prompt: str,
+        log_callback: Callable[[str, str], None],
+        command_approval_callback: Optional[Callable[[str], bool]] = None,
+        is_general_chat: bool = False,
+        execution_mode: str = "auto",
+    ) -> str:
+
+        # --- GENERAL CHAT BYPASS: no project selected → always Groq-only,
+        # regardless of the mode the user picked. ---
+        if is_general_chat:
+            log_callback("system", "⚡ General Chat Mode: Bypassing file scan...")
+            messages = [
+                {"role": "system", "content": "You are AetherAgent, an AI coding assistant. The user is in general chat mode. No project folder is active."},
+                {"role": "user", "content": user_prompt}
+            ]
+            try:
+                response_msg = self.groq_provider.client.chat.completions.create(
+                    model=self.groq_provider.model_name,
+                    messages=messages,
+                    temperature=0.6
+                ).choices[0].message
+                final_answer = response_msg.content or "No response generated."
+                log_callback("ai", final_answer)
+                return final_answer
+            except Exception as e:
+                err = f"Groq API Error: {str(e)}"
+                log_callback("system", f"❌ {err}")
+                return err
+
+        tools = self.get_tool_definitions()
+
+        # --- Smart routing ---
+        referenced_files: List[Tuple[str, str]] = []
+        if execution_mode in ("auto", "direct"):
+            referenced_files = find_referenced_files(user_prompt, self.file_manager)
+
+        use_deep_scan = execution_mode == "deep" or (execution_mode == "auto" and not referenced_files)
+
+        if use_deep_scan:
+            log_callback("system", "🔍 Phase 1: Scanning project directory with Gemini...")
+            dir_tree = self._get_directory_tree()
+
+            gemini_prompt = PromptBuilder.build_gemini_analysis_prompt(user_prompt, dir_tree)
+            gemini_analysis = self.gemini_provider.generate_response(gemini_prompt)
+
+            log_callback("ai", f"📋 **Gemini Diagnosis:**\n\n{gemini_analysis}")
+            log_callback("system", "⚡ Phase 2: Handing over to Groq for tool execution...")
+
+            user_content = f"User Request: {user_prompt}\n\nGemini Diagnosis:\n{gemini_analysis}"
+        else:
+            reason = "Instant mode is selected" if execution_mode == "direct" else "explicit file reference(s) were detected in your message"
+            log_callback("system", f"⚡ Skipping directory scan — {reason}. Handing straight to Groq...")
+
+            if referenced_files:
+                context_blocks = "\n\n".join(f"--- {path} ---\n{content}" for path, content in referenced_files)
+                user_content = (
+                    f"User Request: {user_prompt}\n\n"
+                    f"Referenced file(s), pre-loaded — call read_file again only if you need "
+                    f"something not shown here (e.g. an import):\n{context_blocks}"
+                )
+            else:
+                user_content = f"User Request: {user_prompt}"
+
+        messages = [
+            {"role": "system", "content": PromptBuilder.get_groq_system_instruction()},
+            {"role": "user", "content": user_content}
+        ]
+
+        return self._run_groq_tool_loop(messages, tools, log_callback, command_approval_callback)
