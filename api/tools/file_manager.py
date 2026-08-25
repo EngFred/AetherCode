@@ -35,7 +35,7 @@ class SafeFileManager:
         walking into a large build/ tree) or a huge file read could
         single-handedly blow past Groq's context window on the very next
         call in the tool loop — burning a full turn's tokens on a
-        context_length_exceeded error instead of a usable response.
+        usable response.
         Shared by read_file, run_command, and AetherAgent's
         list_project_files tool — anything whose output lands in the
         message list should route through this.
@@ -148,3 +148,25 @@ class SafeFileManager:
             return "Error: Command timed out after 30 seconds."
         except Exception as e:
             return f"Error executing command: {str(e)}"
+
+    def push_changes(self, commit_message: str = "Auto-commit by AetherAgent") -> str:
+        """Stages all changes, commits with the given message, and pushes to the remote.
+        Returns combined output of the git operations, truncated as needed.
+        """
+        # Ensure we are inside a git repository
+        if not (self.root_path / ".git").exists():
+            return "Error: No git repository found in project root."
+        commands = [
+            "git add -A",
+            f"git commit -m \"{commit_message}\"",
+            "git push"
+        ]
+        combined_output = []
+        for cmd in commands:
+            out = self.run_command(cmd)
+            combined_output.append(f"$ {cmd}\n{out}")
+            # If commit fails because there is nothing to commit, break early
+            if "nothing to commit" in out.lower():
+                # Skip push if no new commit
+                break
+        return self.truncate_output("\n\n".join(combined_output), "git push_changes")

@@ -1,7 +1,23 @@
 'use client';
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Brain, Check, ChevronDown, Command, Cpu, Menu, MessageSquarePlus, Sparkles, User, X as XIcon } from 'lucide-react';
+import {
+  Brain,
+  Check,
+  ChevronDown,
+  Command,
+  Cpu,
+  FilePlus2,
+  FileText,
+  FolderTree,
+  Menu,
+  MessageSquarePlus,
+  Sparkles,
+  Terminal,
+  Trash2,
+  User,
+  X as XIcon,
+} from 'lucide-react';
 import Sidebar from '@/components/Sidebar';
 import ChatInput from '@/components/ChatInput';
 import MarkdownMessage from '@/components/MarkdownMessage';
@@ -9,7 +25,7 @@ import MarkdownMessage from '@/components/MarkdownMessage';
 type ExecutionMode = 'direct' | 'auto' | 'deep';
 
 type Message = {
-  role: 'user' | 'ai' | 'system' | 'thinking' | 'approval_request';
+  role: 'user' | 'ai' | 'system' | 'thinking' | 'tool' | 'approval_request';
   text: string;
   id?: string;
   command?: string;
@@ -25,14 +41,20 @@ type TrackedWebSocket = WebSocket & { _intentionalClose?: boolean };
 
 const WS_URL = 'ws://localhost:8000/ws/chat';
 
-// Collapsed-by-default block for the "thinking" role — Gemini's internal
-// file-targeting analysis. Never rendered as a chat bubble on its own; it
-// sits above the real "ai" reply so the user always hears one voice, with
-// the reasoning one click away if they want it.
-function ThinkingBlock({ text }: { text: string }) {
+// Shared shell for any collapsed, click-to-expand log entry — used by both
+// the Gemini "Analysis" step and individual tool calls, so a single style
+// (and a single place to tweak it) covers both instead of two near-duplicate
+// components drifting apart over time.
+function CollapsibleBlock({
+  icon: Icon,
+  label,
+  children,
+}: {
+  icon: React.ElementType;
+  label: string;
+  children: React.ReactNode;
+}) {
   const [expanded, setExpanded] = useState(false);
-
-  if (!text.trim()) return null;
 
   return (
     <div className="min-w-0 max-w-[calc(100%-2.75rem)] overflow-hidden rounded-2xl border border-white/5 bg-[#18181B]/40 sm:max-w-[85%]">
@@ -41,18 +63,71 @@ function ThinkingBlock({ text }: { text: string }) {
         onClick={() => setExpanded((e) => !e)}
         className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-xs font-medium text-gray-500 transition hover:text-gray-300"
       >
-        <Brain className="h-3.5 w-3.5" />
-        <span>Analysis</span>
-        <ChevronDown className={`ml-auto h-3.5 w-3.5 transition-transform ${expanded ? 'rotate-180' : ''}`} />
+        <Icon className="h-3.5 w-3.5 flex-shrink-0" />
+        <span className="truncate">{label}</span>
+        <ChevronDown className={`ml-auto h-3.5 w-3.5 flex-shrink-0 transition-transform ${expanded ? 'rotate-180' : ''}`} />
       </button>
       {expanded && (
-        <div className="border-t border-white/5 px-4 py-3">
-          <pre className="whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-gray-400">
-            {text}
-          </pre>
-        </div>
+        <div className="border-t border-white/5 px-4 py-3">{children}</div>
       )}
     </div>
+  );
+}
+
+// Collapsed-by-default block for the "thinking" role — Gemini's internal
+// file-targeting analysis. Never rendered as a chat bubble on its own; it
+// sits above the real "ai" reply so the user always hears one voice, with
+// the reasoning one click away if they want it.
+function ThinkingBlock({ text }: { text: string }) {
+  if (!text.trim()) return null;
+
+  return (
+    <CollapsibleBlock icon={Brain} label="Analysis">
+      <pre className="whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-gray-400">
+        {text}
+      </pre>
+    </CollapsibleBlock>
+  );
+}
+
+// One icon per tool name, so a "Wrote src/pages/index.astro" bubble looks
+// visually distinct from a "Ran: npm test" one at a glance. Falls back to
+// the generic Command icon for anything not in the map, so a new backend
+// tool never breaks rendering — it just looks generic until this map is
+// updated to match.
+const TOOL_ICONS: Record<string, React.ElementType> = {
+  read_file: FileText,
+  write_file: FilePlus2,
+  delete_file: Trash2,
+  list_project_files: FolderTree,
+  run_command: Terminal,
+};
+
+// Collapsed-by-default block for the "tool" role. The backend now sends a
+// single JSON payload per tool call ({ tool, label, result }) instead of two
+// raw "system" lines — this is what used to dump an entire list_project_files
+// listing (or any other large tool result) straight into the transcript as
+// permanently-visible text. Now it's a one-line label, click to expand.
+function ToolCallBlock({ text }: { text: string }) {
+  let parsed: { tool: string; label: string; result: string } | null = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    // Defensive fallback only — shouldn't happen since the backend always
+    // sends valid JSON for "tool" messages, but a malformed payload should
+    // never crash the render.
+    return null;
+  }
+  if (!parsed) return null;
+
+  const Icon = TOOL_ICONS[parsed.tool] ?? Command;
+
+  return (
+    <CollapsibleBlock icon={Icon} label={parsed.label}>
+      <pre className="whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-gray-400">
+        {parsed.result}
+      </pre>
+    </CollapsibleBlock>
   );
 }
 
@@ -303,6 +378,24 @@ export default function Home() {
                           </div>
                         </div>
                         <ThinkingBlock text={msg.text} />
+                      </div>
+                    );
+                  }
+
+                  // Individual tool calls (read_file, write_file, run_command, etc).
+                  // Rendered the same way as "thinking" — small icon avatar plus a
+                  // collapsed block — instead of the old two raw "system" bubbles
+                  // per call, which is what used to spill an entire file listing
+                  // directly into the transcript.
+                  if (msg.role === 'tool') {
+                    return (
+                      <div key={idx} className="flex min-w-0 gap-3 sm:gap-4">
+                        <div className="mt-1 flex-shrink-0">
+                          <div className="flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-[#18181B]">
+                            <Command className="h-4 w-4 text-gray-500" />
+                          </div>
+                        </div>
+                        <ToolCallBlock text={msg.text} />
                       </div>
                     );
                   }

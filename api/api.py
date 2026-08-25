@@ -1,5 +1,6 @@
 import os
 import asyncio
+import threading
 from typing import Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -56,7 +57,14 @@ async def chat_endpoint(websocket: WebSocket):
             loop
         )
 
-    async def _wait_for_approval(request_id: str, cmd: str) -> bool:
+    async def _wait_for_approval(request_id: str, cmd: str, cancel_event: threading.Event) -> bool:
+        # Checked once more right here, not just by the caller — closes
+        # the small race window between request_approval() checking
+        # cancel_event and this coroutine actually being scheduled on the
+        # event loop via run_coroutine_threadsafe.
+        if cancel_event.is_set() or client_gone.is_set():
+            return False
+
         fut = loop.create_future()
         pending_approvals[request_id] = fut
         await _safe_send({"role": "approval_request", "id": request_id, "command": cmd})
@@ -67,18 +75,30 @@ async def chat_endpoint(websocket: WebSocket):
         finally:
             pending_approvals.pop(request_id, None)
 
-    def request_approval(cmd: str) -> bool:
+    def request_approval(cmd: str, cancel_event: threading.Event) -> bool:
         """
         Runs on the worker thread (agent.run is inside asyncio.to_thread).
         Blocks until the user responds via an 'approval_response' message,
         or 115s pass, whichever comes first.
+
+        cancel_event belongs to the SPECIFIC turn this call is part of
+        (created fresh per _process_prompt call, below). If that turn's
+        180s ceiling has already fired by the time the agent gets here —
+        which can happen, since the worker thread this runs on can't
+        actually be killed when the timeout hits, only waited-on-no-longer
+        — this returns False immediately instead of sending a fresh
+        approval_request card for a task the frontend was already told
+        was over.
         """
+        if cancel_event.is_set():
+            return False
+
         nonlocal approval_counter
         approval_counter += 1
         request_id = f"approval_{approval_counter}"
 
         concurrent_future = asyncio.run_coroutine_threadsafe(
-            _wait_for_approval(request_id, cmd), loop
+            _wait_for_approval(request_id, cmd, cancel_event), loop
         )
         try:
             return concurrent_future.result(timeout=120)
@@ -102,19 +122,45 @@ async def chat_endpoint(websocket: WebSocket):
             )
             current_working_dir = target_dir
 
+        # Cancellation signal scoped to THIS turn only — fresh Event every
+        # call, never reused. Set the moment this turn's timeout fires,
+        # below. The agent's tool loop checks it before every Groq call,
+        # every tool call, and every approval request; request_approval
+        # above checks it before ever touching the websocket. That's what
+        # actually stops a timed-out turn from continuing to run commands,
+        # request approvals, or mutate agent.chat_history / _recent_files /
+        # file_manager.history in the background after the frontend has
+        # already moved on — since the worker thread itself genuinely
+        # cannot be force-killed once started, only cooperative checks
+        # like this can make cancellation take effect.
+        cancel_event = threading.Event()
+
+        def turn_log_callback(role: str, text: str):
+            # Belt-and-suspenders alongside the agent-side checks: even if
+            # something slips through and calls this after cancellation,
+            # it's dropped here rather than reaching the frontend.
+            if cancel_event.is_set():
+                return
+            ws_log_callback(role, text)
+
+        def turn_approval_callback(cmd: str) -> bool:
+            return request_approval(cmd, cancel_event)
+
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(
                     agent.run,
                     user_prompt=user_prompt,
-                    log_callback=ws_log_callback,
-                    command_approval_callback=request_approval,
+                    log_callback=turn_log_callback,
+                    command_approval_callback=turn_approval_callback,
                     is_general_chat=is_general_chat,
                     execution_mode=execution_mode,
+                    cancel_event=cancel_event,
                 ),
                 timeout=config.AGENT_TURN_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
+            cancel_event.set()
             await _safe_send({
                 "role": "system",
                 "text": f"❌ Turn timed out after {config.AGENT_TURN_TIMEOUT_SECONDS}s. "

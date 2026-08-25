@@ -32,7 +32,16 @@ IGNORED_DIRECTORIES = {
 
 ALLOWED_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".html", ".css",
-    ".json", ".md", ".env", ".yaml", ".yml", ".sql", ".sh"
+    ".json", ".md", ".env", ".yaml", ".yml", ".sql", ".sh",
+    # Flutter/Dart projects — missing .dart was the direct cause of every
+    # write_file() call in a Flutter project failing with "Writing files
+    # with extension '.dart' is not permitted," no matter what the user
+    # approved. The rest of this group covers the native Android/iOS
+    # config files a Flutter project typically also needs edited
+    # (build.gradle, AndroidManifest.xml, Info.plist, localization .arb
+    # files) — trim this list down if you don't want the agent touching
+    # native platform config.
+    ".dart", ".gradle", ".kt", ".kts", ".swift", ".xml", ".plist", ".arb",
 }
 
 # --- SMART ROUTING (Auto mode) ---
@@ -78,7 +87,12 @@ GROQ_REQUEST_TIMEOUT_SECONDS = 60
 # Hard ceiling for one full agent.run() turn — covers the Gemini scan AND
 # the whole Groq tool loop. This is a connection-level safety net: it
 # catches a hang ANYWHERE in the turn (not just a slow Groq call), and is
-# what stops the frontend's "isRunning" from getting stuck forever. See
-# api.py for the caveat about it not being able to kill the underlying
-# thread.
-AGENT_TURN_TIMEOUT_SECONDS = 180.
+# what stops the frontend's "isRunning" from getting stuck forever.
+#
+# NOTE: this only stops the frontend from WAITING past this point — the
+# underlying worker thread running agent.run() cannot actually be killed
+# once started (Python threads aren't forcibly cancellable). See api.py's
+# cancel_event / turn_log_callback / turn_approval_callback for how a
+# timed-out turn is kept from doing anything further (more tool calls,
+# more approval requests, more state mutation) after this fires.
+AGENT_TURN_TIMEOUT_SECONDS = 180
