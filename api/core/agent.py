@@ -26,6 +26,8 @@ def _tool_call_label(name: str, args: Dict[str, Any]) -> str:
         return "Listed project files"
     if name == "run_command":
         return f"Ran: {args.get('command', '')}"
+    if name == "push_changes":
+        return f"Pushed changes: {args.get('commit_message', 'Auto-commit by AetherAgent')}"
     return name
 
 
@@ -77,8 +79,25 @@ def _explain_groq_error(raw_err: str) -> str:
     sentence for the user-facing failure message in _run_groq_tool_loop.
     Falls back to a generic line for anything not specifically recognized,
     so an unfamiliar error shape still reads as a sentence, not raw JSON.
+
+    Only the portion of raw_err BEFORE any echoed model output (e.g. a
+    failed tool call's 'failed_generation' payload) is searched. That
+    payload is arbitrary text the model was trying to write — it can
+    contain coincidental substrings like "413" inside a code comment,
+    which previously caused this function to misreport an unrelated
+    failure (a malformed tool-call JSON) as a request-size/rate-limit
+    issue.
     """
-    if "rate_limit_exceeded" in raw_err or "413" in raw_err:
+    search_region = raw_err.split("failed_generation", 1)[0]
+
+    if "tool_use_failed" in search_region:
+        return (
+            "The model generated an invalid tool call — this usually happens when it "
+            "tries to write or rewrite a very large file in a single step and the "
+            "output gets malformed along the way. Try asking for a smaller, more "
+            "targeted change instead of a full-file rewrite."
+        )
+    if "rate_limit_exceeded" in search_region or "413" in search_region:
         return (
             "The conversation for this task grew too large for the model's "
             "per-request limit — usually caused by several broad searches "
@@ -161,6 +180,27 @@ class AetherAgent:
                     ),
                     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "push_changes",
+                    "description": (
+                        "Stage all changes, commit them, and push to the remote git "
+                        "repository in one step. Use this instead of running 'git add', "
+                        "'git commit', and 'git push' individually via run_command."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "commit_message": {
+                                "type": "string",
+                                "description": "Commit message to use. Optional — defaults to 'Auto-commit by AetherAgent' if omitted."
+                            }
+                        },
+                        "required": []
+                    }
+                }
             }
         ]
 
@@ -191,6 +231,9 @@ class AetherAgent:
             if command_approval_callback and not command_approval_callback(cmd):
                 return "Execution Denied: User rejected terminal command execution."
             return self.file_manager.run_command(cmd)
+        elif tool_name == "push_changes":
+            commit_msg = args.get("commit_message", "Auto-commit by AetherAgent")
+            return self.file_manager.push_changes(commit_msg)
         else:
             return f"Error: Unknown tool '{tool_name}'"
 
