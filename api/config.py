@@ -39,6 +39,28 @@ ALLOWED_EXTENSIONS = {
 MAX_REFERENCED_FILES = 5
 MAX_REFERENCED_FILE_CHARS = 12000
 
+# --- CHIT-CHAT DETECTION (Auto mode routing) ---
+# Upper bound on message length for the chit-chat shortcut in
+# tools/chitchat_utils.is_chitchat. Kept short and conservative — this is
+# only meant to catch plain greetings/acknowledgements ("hey", "thanks"),
+# never a real request that happens to open politely. Anything longer
+# than this just falls through to normal Auto-mode routing, which is
+# always correct — just not free.
+MAX_CHITCHAT_CHARS = 60
+
+# --- TOOL OUTPUT SAFETY ---
+# Hard cap (characters) on any single tool result — read_file,
+# run_command, list_project_files — before it's appended to the Groq
+# message list. This is the fix for an unfiltered command (e.g. `ls -R`
+# walking into a huge build/ tree) or a large file read single-handedly
+# blowing past Groq's context window on the very next call in the tool
+# loop: previously that surfaced as a 400 context_length_exceeded error
+# that burned the whole turn's tokens for nothing. Kept >=
+# MAX_REFERENCED_FILE_CHARS so this outer cap never double-truncates a
+# file that find_referenced_files() already intentionally pre-loads at
+# that budget. See tools/file_manager.SafeFileManager.truncate_output.
+MAX_TOOL_OUTPUT_CHARS = 12000
+
 # --- CONVERSATION MEMORY ---
 # Keeps follow-up messages actually continuous, while keeping every call
 # token-frugal enough not to eat into free-tier daily limits.
@@ -59,4 +81,4 @@ GROQ_REQUEST_TIMEOUT_SECONDS = 60
 # what stops the frontend's "isRunning" from getting stuck forever. See
 # api.py for the caveat about it not being able to kill the underlying
 # thread.
-AGENT_TURN_TIMEOUT_SECONDS = 180
+AGENT_TURN_TIMEOUT_SECONDS = 180.

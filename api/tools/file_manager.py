@@ -28,6 +28,29 @@ class SafeFileManager:
             raise PermissionError(f"Access denied: Path '{relative_path}' attempts to leave project root.")
         return target_path
 
+    def truncate_output(self, text: str, source_label: str) -> str:
+        """
+        Hard caps any tool output before it re-enters the conversation as a
+        'tool' message. Without this, an unrestrained command (e.g. `ls -R`
+        walking into a large build/ tree) or a huge file read could
+        single-handedly blow past Groq's context window on the very next
+        call in the tool loop — burning a full turn's tokens on a
+        context_length_exceeded error instead of a usable response.
+        Shared by read_file, run_command, and AetherAgent's
+        list_project_files tool — anything whose output lands in the
+        message list should route through this.
+        """
+        limit = config.MAX_TOOL_OUTPUT_CHARS
+        if len(text) <= limit:
+            return text
+        return (
+            text[:limit]
+            + f"\n\n[...output truncated — {source_label} was {len(text)} chars, "
+              f"showing first {limit}. Narrow your command or path and call the "
+              f"tool again if you need the rest — do not re-run the exact same "
+              f"call expecting more.]"
+        )
+
     def _create_backup(self, relative_path: str):
         """Creates a hidden backup before any file edit or deletion."""
         try:
@@ -66,7 +89,9 @@ class SafeFileManager:
                 return f"Error: Path '{relative_path}' is a directory, not a file."
 
             with open(target_path, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()
+                content = f.read()
+
+            return self.truncate_output(content, f"file '{relative_path}'")
         except PermissionError as e:
             return f"Error: {str(e)}"
         except Exception as e:
@@ -117,7 +142,8 @@ class SafeFileManager:
                 timeout=30
             )
             output = result.stdout or result.stderr
-            return output if output.strip() else "Command executed with no output."
+            output = output if output.strip() else "Command executed with no output."
+            return self.truncate_output(output, f"command '{command}'")
         except subprocess.TimeoutExpired:
             return "Error: Command timed out after 30 seconds."
         except Exception as e:
