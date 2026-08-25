@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Check, Command, Cpu, Menu, MessageSquarePlus, Sparkles, User, X as XIcon } from 'lucide-react';
+import { Brain, Check, ChevronDown, Command, Cpu, Menu, MessageSquarePlus, Sparkles, User, X as XIcon } from 'lucide-react';
 import Sidebar from '@/components/Sidebar';
 import ChatInput from '@/components/ChatInput';
 import MarkdownMessage from '@/components/MarkdownMessage';
@@ -9,7 +9,7 @@ import MarkdownMessage from '@/components/MarkdownMessage';
 type ExecutionMode = 'direct' | 'auto' | 'deep';
 
 type Message = {
-  role: 'user' | 'ai' | 'system' | 'approval_request';
+  role: 'user' | 'ai' | 'system' | 'thinking' | 'approval_request';
   text: string;
   id?: string;
   command?: string;
@@ -24,6 +24,37 @@ type Message = {
 type TrackedWebSocket = WebSocket & { _intentionalClose?: boolean };
 
 const WS_URL = 'ws://localhost:8000/ws/chat';
+
+// Collapsed-by-default block for the "thinking" role — Gemini's internal
+// file-targeting analysis. Never rendered as a chat bubble on its own; it
+// sits above the real "ai" reply so the user always hears one voice, with
+// the reasoning one click away if they want it.
+function ThinkingBlock({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false);
+
+  if (!text.trim()) return null;
+
+  return (
+    <div className="min-w-0 max-w-[calc(100%-2.75rem)] overflow-hidden rounded-2xl border border-white/5 bg-[#18181B]/40 sm:max-w-[85%]">
+      <button
+        type="button"
+        onClick={() => setExpanded((e) => !e)}
+        className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-xs font-medium text-gray-500 transition hover:text-gray-300"
+      >
+        <Brain className="h-3.5 w-3.5" />
+        <span>Analysis</span>
+        <ChevronDown className={`ml-auto h-3.5 w-3.5 transition-transform ${expanded ? 'rotate-180' : ''}`} />
+      </button>
+      {expanded && (
+        <div className="border-t border-white/5 px-4 py-3">
+          <pre className="whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-gray-400">
+            {text}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -83,6 +114,12 @@ export default function Home() {
 
     ws.onclose = () => {
       setIsConnected(false);
+      // A clean close with no onerror event previously left "isRunning"
+      // stuck at true forever (input disabled, stop-icon frozen) whenever
+      // the socket dropped mid-task without the backend's "--- END OF
+      // TASK ---" marker making it through — see the api.py fix for why
+      // that could happen. Reset here too, not just on error/end-of-task.
+      setIsRunning(false);
       wsRef.current = null;
     };
 
@@ -253,6 +290,19 @@ export default function Home() {
                             </div>
                           )}
                         </div>
+                      </div>
+                    );
+                  }
+
+                  if (msg.role === 'thinking') {
+                    return (
+                      <div key={idx} className="flex min-w-0 gap-3 sm:gap-4">
+                        <div className="mt-1 flex-shrink-0">
+                          <div className="flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-[#18181B]">
+                            <Brain className="h-4 w-4 text-gray-500" />
+                          </div>
+                        </div>
+                        <ThinkingBlock text={msg.text} />
                       </div>
                     );
                   }

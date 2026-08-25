@@ -253,10 +253,20 @@ class AetherAgent:
             gemini_prompt = PromptBuilder.build_gemini_analysis_prompt(user_prompt, dir_tree)
             gemini_analysis = self.gemini_provider.generate_response(gemini_prompt)
 
-            log_callback("ai", f"📋 **Gemini Diagnosis:**\n\n{gemini_analysis}")
-            log_callback("system", "⚡ Phase 2: Handing over to Groq for tool execution...")
+            if gemini_analysis.startswith("Gemini Provider Error:"):
+               # Infra failure, not a real diagnosis. Keep the user-facing
+                # message clean — the raw error (stack/JSON) goes to the
+                # server console only, for your own debugging, never into
+                # the chat UI. Groq falls back to its own read_file
+                # run_command tools to figure out the project.
+                log_callback("system", "⚠️ Gemini unavailable — proceeding with Groq only.")
+                print(f"[AetherAgent] Gemini scan failed: {gemini_analysis}")
+                user_content = f"User Request: {user_prompt}"
+            else:
+                log_callback("thinking", gemini_analysis)
+                user_content = f"User Request: {user_prompt}\n\nDiagnosis:\n{gemini_analysis}"
 
-            user_content = f"User Request: {user_prompt}\n\nGemini Diagnosis:\n{gemini_analysis}"
+            log_callback("system", "⚡ Phase 2: Handing over to Groq for tool execution...")
         else:
             if execution_mode == "direct":
                 reason = "Instant mode is selected"

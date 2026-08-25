@@ -22,26 +22,44 @@ async def chat_endpoint(websocket: WebSocket):
     await websocket.accept()
     loop = asyncio.get_running_loop()
 
-    # One agent per connection, rebuilt only when the working directory
-    # changes. This also fixes `undo`, which previously reset every message
-    # because a brand new SafeFileManager (and its history stack) was created
-    # on every single prompt.
     agent: Optional[AetherAgent] = None
     current_working_dir: Optional[str] = None
 
     pending_approvals: Dict[str, asyncio.Future] = {}
     approval_counter = 0
+    client_gone = asyncio.Event()
+
+    # Incoming prompts go on this queue instead of being processed inline
+    # by the receive loop. This is the actual fix for approvals hanging
+    # forever: previously the SAME loop that reads incoming websocket
+    # messages was also the one blocked awaiting agent.run() for the
+    # whole turn — so an 'approval_response' the user sent mid-task could
+    # never be read until the task finished, and the task could never
+    # finish until the approval was read. Deadlock, resolved only by the
+    # 115s approval timeout (as an automatic DENY, not an approve).
+    # Splitting "receive" and "process" into a producer/consumer pair
+    # means the receive loop is always free to read the next message —
+    # including an approval_response arriving mid-turn.
+    prompt_queue: asyncio.Queue = asyncio.Queue()
+
+    async def _safe_send(payload: dict):
+        if client_gone.is_set():
+            return
+        try:
+            await websocket.send_json(payload)
+        except Exception:
+            pass
 
     def ws_log_callback(role: str, text: str):
         asyncio.run_coroutine_threadsafe(
-            websocket.send_json({"role": role, "text": text}),
+            _safe_send({"role": role, "text": text}),
             loop
         )
 
     async def _wait_for_approval(request_id: str, cmd: str) -> bool:
         fut = loop.create_future()
         pending_approvals[request_id] = fut
-        await websocket.send_json({"role": "approval_request", "id": request_id, "command": cmd})
+        await _safe_send({"role": "approval_request", "id": request_id, "command": cmd})
         try:
             return await asyncio.wait_for(fut, timeout=115)
         except asyncio.TimeoutError:
@@ -67,9 +85,74 @@ async def chat_endpoint(websocket: WebSocket):
         except Exception:
             return False
 
+    async def _process_prompt(data: dict):
+        nonlocal agent, current_working_dir
+
+        user_prompt = data.get("prompt")
+        working_dir = data.get("working_dir")
+        execution_mode = data.get("execution_mode", "auto")
+        is_general_chat = not bool(working_dir)
+        target_dir = working_dir or os.getcwd()
+
+        if agent is None or current_working_dir != target_dir:
+            agent = AetherAgent(
+                root_dir=target_dir,
+                gemini_key=config.GEMINI_API_KEY,
+                groq_key=config.GROQ_API_KEY
+            )
+            current_working_dir = target_dir
+
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    agent.run,
+                    user_prompt=user_prompt,
+                    log_callback=ws_log_callback,
+                    command_approval_callback=request_approval,
+                    is_general_chat=is_general_chat,
+                    execution_mode=execution_mode,
+                ),
+                timeout=config.AGENT_TURN_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            await _safe_send({
+                "role": "system",
+                "text": f"❌ Turn timed out after {config.AGENT_TURN_TIMEOUT_SECONDS}s. "
+                        "Try again, or check whether Groq/Gemini are slow to respond right now."
+            })
+        except Exception as e:
+            await _safe_send({"role": "system", "text": f"❌ Agent Error: {str(e)}"})
+
+        await asyncio.sleep(0.1)
+        await _safe_send({"role": "system", "text": "--- END OF TASK ---"})
+
+    async def _prompt_worker():
+        """Processes one turn at a time, pulled off prompt_queue. Kept as
+        its own task so a long-running turn never blocks the receive loop
+        below from reading new messages in the meantime."""
+        while True:
+            payload = await prompt_queue.get()
+            if payload is None:
+                return
+            try:
+                await _process_prompt(payload)
+            finally:
+                prompt_queue.task_done()
+
+    worker_task = asyncio.create_task(_prompt_worker())
+
     try:
         while True:
-            data = await websocket.receive_json()
+            try:
+                data = await websocket.receive_json()
+            except WebSocketDisconnect:
+                break
+            except RuntimeError:
+                # Starlette can raise this instead of WebSocketDisconnect
+                # if receive() is called again after the socket has
+                # already fully torn down — treat it the same as a
+                # disconnect instead of letting it crash the ASGI app.
+                break
 
             if data.get("type") == "approval_response":
                 request_id = data.get("id")
@@ -82,40 +165,23 @@ async def chat_endpoint(websocket: WebSocket):
             if data.get("type") == "clear_history":
                 if agent is not None:
                     agent.reset_history()
-                await websocket.send_json({"role": "system", "text": "🧹 New chat started — previous context cleared."})
+                await _safe_send({"role": "system", "text": "🧹 New chat started — previous context cleared."})
                 continue
 
-            user_prompt = data.get("prompt")
-            working_dir = data.get("working_dir")
-            execution_mode = data.get("execution_mode", "auto")
-            is_general_chat = not bool(working_dir)
+            await prompt_queue.put(data)
 
-            target_dir = working_dir or os.getcwd()
-
-            if agent is None or current_working_dir != target_dir:
-                agent = AetherAgent(
-                    root_dir=target_dir,
-                    gemini_key=config.GEMINI_API_KEY,
-                    groq_key=config.GROQ_API_KEY
-                )
-                current_working_dir = target_dir
-
-            try:
-                await asyncio.to_thread(
-                    agent.run,
-                    user_prompt=user_prompt,
-                    log_callback=ws_log_callback,
-                    command_approval_callback=request_approval,
-                    is_general_chat=is_general_chat,
-                    execution_mode=execution_mode,
-                )
-            except Exception as e:
-                # Scoped to this turn only — the connection (and session state)
-                # stays alive for the next message instead of dying here.
-                await websocket.send_json({"role": "system", "text": f"❌ Agent Error: {str(e)}"})
-
-            await asyncio.sleep(0.1)
-            await websocket.send_json({"role": "system", "text": "--- END OF TASK ---"})
-
-    except WebSocketDisconnect:
+    finally:
+        client_gone.set()
+        # Resolve any approval still waiting on this connection immediately
+        # (as a deny) instead of leaving it to burn its full 115s timeout
+        # now that we know no response is ever coming.
+        for fut in pending_approvals.values():
+            if not fut.done():
+                fut.set_result(False)
+        # Lets the worker exit after finishing whatever it's currently on
+        # (if anything) — an in-flight turn isn't force-cancelled; its
+        # sends just get silently dropped by _safe_send from here on. See
+        # earlier note: this can't force-kill the underlying worker
+        # thread either, same caveat as before.
+        await prompt_queue.put(None)
         print("Client disconnected")

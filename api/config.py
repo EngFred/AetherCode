@@ -45,3 +45,18 @@ MAX_REFERENCED_FILE_CHARS = 12000
 MAX_CHAT_HISTORY_TURNS = 12       # how many past (user, assistant) exchanges to resend per call
 MAX_CHAT_HISTORY_CHARS = 16000    # rough char budget for that history block; oldest turns drop first
 MAX_RECENT_FILES_TRACKED = 8      # filenames (not content) carried forward across turns this session
+
+# --- TIMEOUTS ---
+# Per-request timeout enforced by the Groq client itself (seconds). A slow
+# or hung Groq call now raises inside the existing try/except in
+# _run_groq_tool_loop / the general-chat path, instead of blocking the
+# worker thread indefinitely.
+GROQ_REQUEST_TIMEOUT_SECONDS = 60
+
+# Hard ceiling for one full agent.run() turn — covers the Gemini scan AND
+# the whole Groq tool loop. This is a connection-level safety net: it
+# catches a hang ANYWHERE in the turn (not just a slow Groq call), and is
+# what stops the frontend's "isRunning" from getting stuck forever. See
+# api.py for the caveat about it not being able to kill the underlying
+# thread.
+AGENT_TURN_TIMEOUT_SECONDS = 180

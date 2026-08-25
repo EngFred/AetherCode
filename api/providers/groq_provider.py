@@ -17,7 +17,10 @@ class GroqExecutorProvider(BaseAIProvider):
     @property
     def client(self) -> Groq:
         if self._client is None:
-            self._client = Groq(api_key=self.api_key)
+            # timeout is enforced by the underlying httpx client for every
+            # request made through this Groq instance, so both the tool-loop
+            # calls and the general-chat calls in agent.py get it for free.
+            self._client = Groq(api_key=self.api_key, timeout=config.GROQ_REQUEST_TIMEOUT_SECONDS)
         return self._client
 
     def generate_response(
