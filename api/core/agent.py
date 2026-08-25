@@ -181,14 +181,20 @@ class AetherAgent:
                     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}
                 }
             },
-            {
+                        {
                 "type": "function",
                 "function": {
                     "name": "push_changes",
                     "description": (
                         "Stage all changes, commit them, and push to the remote git "
                         "repository in one step. Use this instead of running 'git add', "
-                        "'git commit', and 'git push' individually via run_command."
+                        "'git commit', and 'git push' individually via run_command. "
+                        "This tool does not show you the diff itself — if you want "
+                        "commit_message to actually describe what changed (rather than "
+                        "a generic message), first call run_command with "
+                        "'git diff --stat' (or 'git status --porcelain' for a quicker, "
+                        "file-level view) and base commit_message on that output before "
+                        "calling this tool."
                     ),
                     "parameters": {
                         "type": "object",
