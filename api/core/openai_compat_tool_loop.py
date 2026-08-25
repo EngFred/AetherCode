@@ -16,6 +16,33 @@ from core.tool_loop import (
 OPENAI_COMPAT_LOOP_CHAR_BUDGET = 18000
 
 
+def _sanitize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Strips provider-specific proprietary fields (such as Groq's 'reasoning' or
+    DeepSeek's 'thought') so messages comply strictly with standard OpenAI schema
+    accepted across all providers (Mistral, OpenRouter, Groq).
+    """
+    clean_messages = []
+    for m in messages:
+        role = m.get("role")
+        clean_m: Dict[str, Any] = {"role": role}
+
+        if "content" in m:
+            clean_m["content"] = m["content"]
+
+        if "tool_calls" in m and m["tool_calls"] is not None:
+            clean_m["tool_calls"] = m["tool_calls"]
+
+        if "tool_call_id" in m and m["tool_call_id"] is not None:
+            clean_m["tool_call_id"] = m["tool_call_id"]
+
+        if "name" in m and m["name"] is not None:
+            clean_m["name"] = m["name"]
+
+        clean_messages.append(clean_m)
+    return clean_messages
+
+
 def shrink_tool_history_if_needed(messages: list, budget: int = OPENAI_COMPAT_LOOP_CHAR_BUDGET):
     total = sum(len(m.get("content") or "") for m in messages)
     if total <= budget:
@@ -131,11 +158,12 @@ def run_openai_compat_tool_loop(
             return ToolLoopResult(final_answer="", messages=messages)
 
         shrink_tool_history_if_needed(messages)
+        clean_messages = _sanitize_messages(messages)
 
         try:
             response_msg = provider.client.chat.completions.create(
                 model=provider.model_name,
-                messages=messages,
+                messages=clean_messages,
                 tools=tools,
                 tool_choice="auto",
                 temperature=0.1,
@@ -148,7 +176,17 @@ def run_openai_compat_tool_loop(
             log_callback("system", f"❌ {provider_name} API Error: {raw_err}")
             return ToolLoopResult(provider_error=raw_err, messages=messages)
 
-        messages.append(response_msg.model_dump(exclude_none=True))
+        # Store clean dictionary in messages
+        assistant_dict: Dict[str, Any] = {
+            "role": "assistant",
+            "content": response_msg.content,
+        }
+        if response_msg.tool_calls:
+            assistant_dict["tool_calls"] = [
+                tc.model_dump() if hasattr(tc, "model_dump") else tc
+                for tc in response_msg.tool_calls
+            ]
+        messages.append(assistant_dict)
 
         if response_msg.tool_calls:
             for tool_call in response_msg.tool_calls:
