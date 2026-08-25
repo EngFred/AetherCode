@@ -7,10 +7,14 @@ load_dotenv()
 # --- API KEYS ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "PLACEHOLDER_GROQ_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "PLACEHOLDER_GEMINI_KEY")
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "PLACEHOLDER_CEREBRAS_KEY")
 
 # --- MODEL DEFINITIONS ---
 GROQ_EXECUTOR_MODEL = "openai/gpt-oss-120b"
 GEMINI_ANALYZER_MODEL = "gemini-3.5-flash"
+# llama-3.3-70b is the strongest free tool-calling model on Cerebras.
+# It is fully OpenAI-compatible and resets at 1M tokens / day.
+CEREBRAS_EXECUTOR_MODEL = "llama-3.3-70b"
 
 # --- CORS ---
 # Comma-separated list in the env var, e.g. "http://localhost:3000,app://."
@@ -71,18 +75,23 @@ MAX_CHITCHAT_CHARS = 60
 MAX_TOOL_OUTPUT_CHARS = 12000
 
 # --- CONVERSATION MEMORY ---
-# Keeps follow-up messages actually continuous, while keeping every call
-# token-frugal enough not to eat into free-tier daily limits.
-MAX_CHAT_HISTORY_TURNS = 12       # how many past (user, assistant) exchanges to resend per call
-MAX_CHAT_HISTORY_CHARS = 16000    # rough char budget for that history block; oldest turns drop first
+# Keeps follow-up messages continuous while keeping every call token-frugal.
+# History is the biggest silent token drain across all three providers.
+# Reduced from 12 turns / 16k chars → 8 turns / 12k chars; the window still
+# covers the vast majority of real sessions, but burns ~20 % fewer tokens
+# per call on long conversations.
+MAX_CHAT_HISTORY_TURNS = 8        # how many past (user, assistant) exchanges to resend per call
+MAX_CHAT_HISTORY_CHARS = 12000    # rough char budget for that history block; oldest turns drop first
 MAX_RECENT_FILES_TRACKED = 8      # filenames (not content) carried forward across turns this session
 
 # --- TIMEOUTS ---
-# Per-request timeout enforced by the Groq client itself (seconds). A slow
-# or hung Groq call now raises inside the existing try/except in
-# _run_groq_tool_loop / the general-chat path, instead of blocking the
-# worker thread indefinitely.
+# Per-request timeout enforced by each provider client (seconds).
+# A slow or hung call raises inside the existing try/except in the tool
+# loops instead of blocking the worker thread indefinitely.
 GROQ_REQUEST_TIMEOUT_SECONDS = 60
+# Cerebras is typically very fast (WSE hardware), but keep the same ceiling
+# so agentic tool-loop turns with many sequential calls are still bounded.
+CEREBRAS_REQUEST_TIMEOUT_SECONDS = 60
 
 # Hard ceiling for one full agent.run() turn — covers the Gemini scan AND
 # the whole Groq tool loop. This is a connection-level safety net: it

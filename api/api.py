@@ -118,7 +118,8 @@ async def chat_endpoint(websocket: WebSocket):
             agent = AetherAgent(
                 root_dir=target_dir,
                 gemini_key=config.GEMINI_API_KEY,
-                groq_key=config.GROQ_API_KEY
+                groq_key=config.GROQ_API_KEY,
+                cerebras_key=config.CEREBRAS_API_KEY,
             )
             current_working_dir = target_dir
 

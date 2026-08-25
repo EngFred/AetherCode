@@ -13,7 +13,11 @@ from core.tool_loop import (
 )
 
 
-GROQ_LOOP_CHAR_BUDGET = 24000
+# Maximum total chars across all messages in an active tool-loop before older
+# tool results are trimmed.  Reduced from 24000 → 18000 to save ~25% on
+# mid-loop payload sizes across all three executor providers (Groq, Cerebras,
+# and the Gemini fallback which shares the same message list on hand-off).
+GROQ_LOOP_CHAR_BUDGET = 18000
 
 
 def shrink_tool_history_if_needed(messages: list):

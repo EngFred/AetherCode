@@ -6,39 +6,55 @@ from tools.path_utils import find_referenced_files
 from tools.chitchat_utils import is_chitchat
 from providers.gemini_provider import GeminiAnalyzerProvider
 from providers.groq_provider import GroqExecutorProvider
+from providers.cerebras_provider import CerebrasExecutorProvider
 from core.gemini_tool_loop import explain_gemini_error, run_gemini_tool_loop
 from core.groq_tool_loop import explain_groq_error, is_groq_quota_or_rate_limit, run_groq_tool_loop
+from core.cerebras_tool_loop import (
+    explain_cerebras_error,
+    is_cerebras_quota_or_rate_limit,
+    run_cerebras_tool_loop,
+)
 from core.prompt_builder import PromptBuilder
 import config
 
 
 class AetherAgent:
-    def __init__(self, root_dir: str, gemini_key: Optional[str] = None, groq_key: Optional[str] = None):
+    def __init__(
+        self,
+        root_dir: str,
+        gemini_key: Optional[str] = None,
+        groq_key: Optional[str] = None,
+        cerebras_key: Optional[str] = None,
+    ):
         self.root_dir = root_dir
         self.file_manager = SafeFileManager(root_dir)
         self.gemini_provider = GeminiAnalyzerProvider(api_key=gemini_key)
         self.groq_provider = GroqExecutorProvider(api_key=groq_key)
-        # One AetherAgent now lives for the whole WebSocket session (see api.py),
-        # so caching the tree here is safe and saves a full filesystem walk on
-        # every follow-up message.
+        self.cerebras_provider = CerebrasExecutorProvider(api_key=cerebras_key)
+
+        # One AetherAgent lives for the whole WebSocket session (see api.py),
+        # so caching the tree here saves a full filesystem walk on every
+        # follow-up message.
         self._tree_cache: Optional[str] = None
 
         # --- Session memory ---
-        # Persists for as long as this instance lives (i.e. one working
-        # directory / one connection — see api.py). Cleared automatically on
-        # a project switch, or on demand via reset_history().
+        # Persists for as long as this instance lives (one working directory /
+        # one connection).  Cleared on project switch or via reset_history().
         self.chat_history: List[Dict[str, str]] = []
+
         # Filenames (not content) touched this session, most-recent-last.
         # Lets a vague follow-up ("fix the bug in it") get resolved without
         # re-sending file content or re-running a full Gemini scan.
         self._recent_files: List[str] = []
-        # True when the MOST RECENT turn was routed through the
-        # chit-chat bypass below. Lets a reply that continues an
-        # already-established small-talk exchange ("im good and you?")
-        # skip the scan too, even though it doesn't match one of the
-        # fixed opening phrases in chitchat_utils — see is_chitchat's
-        # is_continuation param.
+
+        # True when the MOST RECENT turn was routed through the chit-chat
+        # bypass.  Lets a reply continuing a small-talk exchange skip the
+        # scan too, even though it doesn't match a fixed opening phrase.
         self._last_turn_was_chitchat: bool = False
+
+    # -----------------------------------------------------------------------
+    # Tool definitions
+    # -----------------------------------------------------------------------
 
     def get_tool_definitions(self) -> list[Dict[str, Any]]:
         return [
@@ -92,7 +108,7 @@ class AetherAgent:
                     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}
                 }
             },
-                        {
+            {
                 "type": "function",
                 "function": {
                     "name": "push_changes",
@@ -120,6 +136,10 @@ class AetherAgent:
                 }
             }
         ]
+
+    # -----------------------------------------------------------------------
+    # Internal helpers
+    # -----------------------------------------------------------------------
 
     def _track_recent_file(self, relative_path: str):
         if relative_path in self._recent_files:
@@ -165,8 +185,8 @@ class AetherAgent:
     def _get_history_window(self) -> List[Dict[str, str]]:
         """
         Bounded slice of chat_history to prepend to the next call — bounded
-        by turn count AND a rough character budget, so a long session never
-        silently balloons the request (and your daily token quota) forever.
+        by turn count AND a rough character budget so a long session never
+        silently balloons the request (and daily token quota) forever.
         Oldest turns drop first, in (user, assistant) pairs.
         """
         if not self.chat_history:
@@ -183,27 +203,41 @@ class AetherAgent:
         return window
 
     def _append_turn(self, user_prompt: str, assistant_answer: str):
-        """Persists one (user, assistant) exchange. Infra errors are skipped
-        so a Groq/Gemini hiccup doesn't end up in the model's own memory."""
-        if assistant_answer.startswith("Groq API Error:"):
+        """
+        Persists one (user, assistant) exchange.
+        Infra / provider errors are skipped so a failed call doesn't
+        pollute the model's own memory.
+        """
+        # Skip error strings from any provider so partial failures are
+        # never replayed as if they were successful AI responses.
+        skip_prefixes = (
+            "Groq API Error:",
+            "Cerebras API Error:",
+            "Gemini Provider Error:",
+        )
+        if any(assistant_answer.startswith(p) for p in skip_prefixes):
             return
 
         self.chat_history.append({"role": "user", "content": user_prompt})
         self.chat_history.append({"role": "assistant", "content": assistant_answer})
 
-        # Belt-and-braces ceiling above the normal window size, so the raw
-        # list itself can't grow unbounded across a very long-lived connection.
+        # Belt-and-braces ceiling above the normal window so the raw list
+        # can't grow unbounded across a very long-lived connection.
         hard_cap = config.MAX_CHAT_HISTORY_TURNS * 4
         if len(self.chat_history) > hard_cap:
             self.chat_history = self.chat_history[-hard_cap:]
 
     def reset_history(self) -> str:
-        """Forgets the conversation (e.g. user clicked 'New Chat'). File
-        backups / undo stack are untouched — this only clears memory."""
+        """Forgets the conversation (e.g. user clicked 'New Chat').
+        File backups / undo stack are untouched — only memory is cleared."""
         self.chat_history = []
         self._recent_files = []
         self._last_turn_was_chitchat = False
         return "Conversation memory cleared."
+
+    # -----------------------------------------------------------------------
+    # Lightweight-chat path (no tools, no scan)
+    # -----------------------------------------------------------------------
 
     def _run_lightweight_chat(
         self,
@@ -213,38 +247,97 @@ class AetherAgent:
         cancel_event: Optional[threading.Event] = None,
     ) -> str:
         """
-        Single-call, no-tools Groq path. Used for both general chat (no
-        project linked) and chit-chat inside a linked project (see
-        is_chitchat) — the cheapest possible turn, reserved for messages
-        that plainly don't need the directory scan or the tool loop.
+        Single-call, no-tools path.  Used for general chat (no project
+        linked) and chit-chat inside a linked project.
+
+        Fallback chain: Groq → Cerebras.
+        Gemini is intentionally excluded here (its tool-loop interface is
+        different and would be overkill for a plain-text reply).
         """
         messages = [
             {"role": "system", "content": system_content},
             *self._get_history_window(),
             {"role": "user", "content": user_prompt},
         ]
+
+        # --- Primary: Groq ---
         try:
             response_msg = self.groq_provider.client.chat.completions.create(
                 model=self.groq_provider.model_name,
                 messages=messages,
-                temperature=0.6
+                temperature=0.6,
             ).choices[0].message
             final_answer = response_msg.content or "No response generated."
 
             if cancel_event is not None and cancel_event.is_set():
-                # This turn's timeout already fired while the call was in
-                # flight — the frontend has already been told the task is
-                # over, so don't send a late reply for it or save it.
                 return ""
 
             log_callback("ai", final_answer)
             self._append_turn(user_prompt, final_answer)
             return final_answer
+
         except Exception as e:
-            err = f"Groq API Error: {str(e)}"
-            if cancel_event is None or not cancel_event.is_set():
-                log_callback("system", f"❌ {err}")
+            raw_err = str(e)
+            if cancel_event is not None and cancel_event.is_set():
+                return ""
+
+            # If Groq is rate-limited, try Cerebras before giving up.
+            if is_groq_quota_or_rate_limit(raw_err):
+                log_callback(
+                    "system",
+                    "⚠️ Groq quota reached — switching to Cerebras for this reply...",
+                )
+                return self._run_lightweight_chat_cerebras(
+                    user_prompt, messages, log_callback, cancel_event
+                )
+
+            # Non-quota Groq error — surface it cleanly.
+            err = f"Groq API Error: {raw_err}"
+            log_callback("system", f"❌ {err}")
             return err
+
+    def _run_lightweight_chat_cerebras(
+        self,
+        user_prompt: str,
+        messages: list,
+        log_callback: Callable[[str, str], None],
+        cancel_event: Optional[threading.Event] = None,
+    ) -> str:
+        """
+        Cerebras fallback for the lightweight (no-tools) chat path.
+        Called only when Groq hits a quota/rate-limit.
+        """
+        try:
+            response_msg = self.cerebras_provider.client.chat.completions.create(
+                model=self.cerebras_provider.model_name,
+                messages=messages,
+                temperature=0.6,
+            ).choices[0].message
+            final_answer = response_msg.content or "No response generated."
+
+            if cancel_event is not None and cancel_event.is_set():
+                return ""
+
+            log_callback("ai", final_answer)
+            self._append_turn(user_prompt, final_answer)
+            return final_answer
+
+        except Exception as e:
+            raw_err = str(e)
+            if cancel_event is not None and cancel_event.is_set():
+                return ""
+
+            err_msg = (
+                "⚠️ Both Groq and Cerebras are currently rate-limited and couldn't "
+                "respond. Please wait a few minutes and try again."
+            )
+            log_callback("system", f"❌ Cerebras API Error: {raw_err}")
+            log_callback("ai", err_msg)
+            return err_msg
+
+    # -----------------------------------------------------------------------
+    # Main entry point
+    # -----------------------------------------------------------------------
 
     def run(
         self,
@@ -256,8 +349,7 @@ class AetherAgent:
         cancel_event: Optional[threading.Event] = None,
     ) -> str:
 
-        # --- GENERAL CHAT BYPASS: no project selected → always Groq-only,
-        # regardless of the mode the user picked. ---
+        # --- GENERAL CHAT BYPASS: no project selected → lightweight path ---
         if is_general_chat:
             log_callback("system", "⚡ General Chat Mode: Bypassing file scan...")
             return self._run_lightweight_chat(
@@ -273,14 +365,7 @@ class AetherAgent:
                 cancel_event=cancel_event,
             )
 
-        # --- CHIT-CHAT BYPASS: a project IS linked, but this specific turn
-        # is plainly small talk (greeting, thanks, etc.) with no code
-        # signal in it. Without this, every "hey" / "how are you" on a
-        # linked project used to trigger a full Gemini directory scan AND
-        # a Groq tool-loop call just to produce a one-line reply. Kept
-        # deliberately conservative by is_chitchat: any file-extension-
-        # looking token or task verb anywhere in the prompt disqualifies
-        # it, so a real request is never misrouted here. ---
+        # --- CHIT-CHAT BYPASS: project linked but message is plainly small talk ---
         if is_chitchat(user_prompt, is_continuation=self._last_turn_was_chitchat):
             log_callback("system", "⚡ Small talk detected — skipping scan and tool loop...")
             self._last_turn_was_chitchat = True
@@ -294,8 +379,8 @@ class AetherAgent:
                     "project — respond naturally and briefly, without mentioning "
                     "files, scans, or tools. You cannot inspect files, change files, "
                     "run commands, commit, or push from this no-tools chat path, so "
-                    "never claim you did any of those things. This is a continuous conversation — use "
-                    "the earlier turns below for context."
+                    "never claim you did any of those things. This is a continuous "
+                    "conversation — use the earlier turns below for context."
                 ),
                 cancel_event=cancel_event,
             )
@@ -311,10 +396,8 @@ class AetherAgent:
             for path, _ in referenced_files:
                 self._track_recent_file(path)
 
-        # In Auto mode, skip the full Gemini scan not just when the prompt
-        # names a file, but also when we already have file context from
-        # earlier in this session — a bare "now fix the bug in it" shouldn't
-        # trigger a whole new project scan when we just read that file.
+        # Skip the full Gemini scan not just when the prompt names a file,
+        # but also when we already have file context from earlier this session.
         use_deep_scan = execution_mode == "deep" or (
             execution_mode == "auto" and not referenced_files and not self._recent_files
         )
@@ -327,19 +410,16 @@ class AetherAgent:
             gemini_analysis = self.gemini_provider.generate_response(gemini_prompt)
 
             if gemini_analysis.startswith("Gemini Provider Error:"):
-                # Infra failure, not a real diagnosis. Keep the user-facing
-                # message clean — the raw error (stack/JSON) goes to the
-                # server console only, for your own debugging, never into
-                # the chat UI. Groq falls back to its own read_file /
-                # run_command tools to figure out the project.
-                log_callback("system", "⚠️ Gemini unavailable — proceeding with Groq only.")
+                # Infra failure, not a real diagnosis.  Groq will use its own
+                # tools to figure out the project.
+                log_callback("system", "⚠️ Gemini unavailable — proceeding with executor chain only.")
                 print(f"[AetherAgent] Gemini scan failed: {gemini_analysis}")
                 user_content = f"User Request: {user_prompt}"
             else:
                 log_callback("thinking", gemini_analysis)
                 user_content = f"User Request: {user_prompt}\n\nDiagnosis:\n{gemini_analysis}"
 
-            log_callback("system", "⚡ Phase 2: Handing over to Groq for tool execution...")
+            log_callback("system", "⚡ Phase 2: Handing over to executor chain...")
         else:
             if execution_mode == "direct":
                 reason = "Instant mode is selected"
@@ -347,7 +427,7 @@ class AetherAgent:
                 reason = "explicit file reference(s) were detected in your message"
             else:
                 reason = "using file context from earlier in this session"
-            log_callback("system", f"⚡ Skipping directory scan — {reason}. Handing straight to Groq...")
+            log_callback("system", f"⚡ Skipping directory scan — {reason}. Handing straight to executor chain...")
 
             if referenced_files:
                 context_blocks = "\n\n".join(f"--- {path} ---\n{content}" for path, content in referenced_files)
@@ -378,15 +458,17 @@ class AetherAgent:
         )
 
         if cancel_event is not None and cancel_event.is_set():
-            # This turn's 180s ceiling fired while the tool loop was still
-            # running. The frontend was already told the task ended, so
-            # nothing further is sent — and nothing is saved to
-            # chat_history: a cancelled, incomplete exchange would just be
-            # confusing context for whatever the next real turn is.
+            # The turn's 180s ceiling fired while the tool loop was still
+            # running.  Nothing further is sent or saved — a cancelled,
+            # incomplete exchange would be confusing context for the next turn.
             return final_answer
 
         self._append_turn(user_prompt, final_answer)
         return final_answer
+
+    # -----------------------------------------------------------------------
+    # 3-stage executor fallback chain
+    # -----------------------------------------------------------------------
 
     def _run_executor_tool_loop(
         self,
@@ -396,6 +478,24 @@ class AetherAgent:
         command_approval_callback: Optional[Callable[[str], bool]],
         cancel_event: Optional[threading.Event] = None,
     ) -> str:
+        """
+        Runs the executor chain: Groq → Cerebras → Gemini.
+
+        Each stage:
+          1. Attempts a full tool-calling loop with full conversation context.
+          2. On success — returns immediately (the other providers are untouched).
+          3. On quota / rate-limit 429 — logs a status message and hands the
+             accumulated message history to the next stage so it picks up
+             exactly where the previous model left off.
+          4. On any other error (malformed tool call, timeout, etc.) — surfaces
+             a friendly message immediately without continuing the chain, since
+             retrying a non-quota failure on a different provider rarely helps.
+
+        User-visible status messages at each hand-off make the fallback
+        transparent without being alarming.
+        """
+
+        # ── Stage 1: Groq ───────────────────────────────────────────────────
         groq_result = run_groq_tool_loop(
             self.groq_provider,
             messages,
@@ -405,49 +505,102 @@ class AetherAgent:
             command_approval_callback,
             cancel_event=cancel_event,
         )
+
         if groq_result.ok:
             return groq_result.final_answer
 
-        raw_err = groq_result.provider_error or ""
         if cancel_event is not None and cancel_event.is_set():
             return ""
 
-        if is_groq_quota_or_rate_limit(raw_err):
-            log_callback(
-                "system",
-                "⚠️ Groq hit a quota/rate limit mid-task. Continuing the same task with Gemini...",
-            )
-            gemini_result = run_gemini_tool_loop(
-                self.gemini_provider,
-                groq_result.messages or messages,
-                tools,
-                log_callback,
-                self._execute_tool,
-                command_approval_callback,
-                cancel_event=cancel_event,
-            )
-            if gemini_result.ok:
-                return gemini_result.final_answer
+        groq_err = groq_result.provider_error or ""
 
-            if cancel_event is not None and cancel_event.is_set():
-                return ""
-
+        if not is_groq_quota_or_rate_limit(groq_err):
+            # Non-quota Groq failure — surface it directly, no chain attempt.
             friendly = (
-                "⚠️ I switched from Groq to Gemini after Groq hit a quota/rate limit, "
-                "but Gemini could not finish the continuation. "
-                f"{explain_gemini_error(gemini_result.provider_error or '')} "
-                "Any changes already completed remain on disk; try again after the "
-                "provider limit clears, or narrow the request if it touches a lot of code."
+                "⚠️ I hit an error partway through this task and had to stop. "
+                f"{explain_groq_error(groq_err)} "
+                "Any changes already completed remain on disk. You can try again — if the "
+                "request touches a lot of code, narrowing it to the specific file or values "
+                "usually helps."
             )
             log_callback("ai", friendly)
             return friendly
 
+        # ── Stage 2: Cerebras ───────────────────────────────────────────────
+        log_callback(
+            "system",
+            "⚠️ Groq's quota was reached mid-task. Continuing seamlessly with Cerebras...",
+        )
+
+        # Pass the full accumulated message list so Cerebras sees every tool
+        # call and result that Groq already performed.
+        cerebras_messages = groq_result.messages or messages
+
+        cerebras_result = run_cerebras_tool_loop(
+            self.cerebras_provider,
+            cerebras_messages,
+            tools,
+            log_callback,
+            self._execute_tool,
+            command_approval_callback,
+            cancel_event=cancel_event,
+        )
+
+        if cerebras_result.ok:
+            return cerebras_result.final_answer
+
+        if cancel_event is not None and cancel_event.is_set():
+            return ""
+
+        cerebras_err = cerebras_result.provider_error or ""
+
+        if not is_cerebras_quota_or_rate_limit(cerebras_err):
+            # Non-quota Cerebras failure — surface it, no Gemini attempt.
+            friendly = (
+                "⚠️ Groq's quota was reached mid-task, and Cerebras (the fallback) "
+                "also encountered an error. "
+                f"{explain_cerebras_error(cerebras_err)} "
+                "Any changes already completed remain on disk. Try again shortly, or "
+                "narrow the request to a smaller change."
+            )
+            log_callback("ai", friendly)
+            return friendly
+
+        # ── Stage 3: Gemini ─────────────────────────────────────────────────
+        log_callback(
+            "system",
+            "⚠️ Cerebras quota also reached. Passing the task to Gemini to finish...",
+        )
+
+        # Pass Cerebras' accumulated messages so Gemini has the full picture.
+        gemini_messages = cerebras_result.messages or cerebras_messages
+
+        gemini_result = run_gemini_tool_loop(
+            self.gemini_provider,
+            gemini_messages,
+            tools,
+            log_callback,
+            self._execute_tool,
+            command_approval_callback,
+            cancel_event=cancel_event,
+        )
+
+        if gemini_result.ok:
+            return gemini_result.final_answer
+
+        if cancel_event is not None and cancel_event.is_set():
+            return ""
+
+        # All three providers exhausted or failed.
+        gemini_err = gemini_result.provider_error or ""
         friendly = (
-            "⚠️ I hit an error partway through this task and had to stop. "
-            f"{explain_groq_error(raw_err)} "
-            "Any changes already completed remain on disk. You can try again - if the "
-            "request touches a lot of code, narrowing it to the specific file or values "
-            "usually helps."
+            "⚠️ All three AI providers (Groq, Cerebras, and Gemini) have either hit "
+            "their daily quota or returned an error for this task. "
+            f"{explain_gemini_error(gemini_err)} "
+            "Any changes already completed remain on disk. "
+            "Free-tier limits typically reset within 24 hours — try again later, "
+            "or break the request into smaller steps to make it fit within the "
+            "remaining quota of one provider."
         )
         log_callback("ai", friendly)
         return friendly
