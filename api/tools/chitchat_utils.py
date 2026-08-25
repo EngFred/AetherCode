@@ -43,7 +43,7 @@ def _normalize(text: str) -> str:
     return text
 
 
-def is_chitchat(prompt: str) -> bool:
+def is_chitchat(prompt: str, is_continuation: bool = False) -> bool:
     """
     True only for turns that plainly need no project context at all —
     greetings, thanks, acknowledgements. Used by AetherAgent.run() to skip
@@ -52,11 +52,23 @@ def is_chitchat(prompt: str) -> bool:
     whole pipeline just to produce "Hey! How can I help?".
 
     Deliberately conservative in both directions:
-    - length-capped and exact-phrase-matched, so it only fires on
-      messages that plainly ARE one of these things, not ones that
-      merely start with one;
+    - length-capped and (for a NEW small-talk exchange) exact-phrase-
+      matched, so it only fires on messages that plainly ARE one of
+      these things, not ones that merely start with one;
     - any file-extension-looking token or task verb anywhere in the
-      message disqualifies it outright.
+      message disqualifies it outright, always — this check runs
+      regardless of is_continuation.
+
+    is_continuation: pass True when the immediately preceding turn in
+    this session was ALSO routed through this bypass. A reply that's
+    plainly continuing an already-established small-talk exchange
+    (e.g. "im good and you?" replying to the agent's own "how's your
+    day going?") won't ever match something from the fixed
+    _CHITCHAT_PHRASES list, and no fixed list ever could — there's no
+    way to enumerate every phrasing of a conversational reply. Once a
+    continuation, it only needs to still pass the length cap and the
+    code-signal check to qualify; exact-phrase matching is reserved for
+    OPENING a chit-chat exchange, where nothing else yet confirms intent.
 
     A false negative here just costs an extra scan (safe). A false
     positive would silently skip a real request (not safe) — so the bar
@@ -67,4 +79,6 @@ def is_chitchat(prompt: str) -> bool:
         return False
     if _CODE_SIGNAL_PATTERN.search(raw):
         return False
+    if is_continuation:
+        return True
     return _normalize(raw) in _CHITCHAT_PHRASES

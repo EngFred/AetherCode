@@ -1,4 +1,5 @@
 import json
+import re
 import threading
 from typing import Callable, Dict, Any, Optional, List, Tuple
 from tools.file_manager import SafeFileManager
@@ -73,21 +74,45 @@ def _shrink_tool_history_if_needed(messages: list):
             total += len(m["content"])
 
 
+_ERROR_CODE_RE = re.compile(r"Error code:\s*(\d{3})")
+_RETRY_AFTER_RE = re.compile(r"try again in (?:([0-9]+)m)?([0-9.]+)s")
+_TPD_RE = re.compile(r"tokens per day \(TPD\)")
+
+
+def _format_wait_time(raw_err: str) -> str:
+    match = _RETRY_AFTER_RE.search(raw_err)
+    if not match:
+        return "a short while"
+    minutes_part, seconds_part = match.groups()
+    minutes = int(minutes_part) if minutes_part else 0
+    seconds = int(float(seconds_part))
+    return f"about {minutes}m {seconds}s" if minutes else f"about {seconds}s"
+
+
 def _explain_groq_error(raw_err: str) -> str:
     """
     Turns a raw Groq/httpx exception string into one plain-language
     sentence for the user-facing failure message in _run_groq_tool_loop.
-    Falls back to a generic line for anything not specifically recognized,
-    so an unfamiliar error shape still reads as a sentence, not raw JSON.
 
-    Only the portion of raw_err BEFORE any echoed model output (e.g. a
-    failed tool call's 'failed_generation' payload) is searched. That
-    payload is arbitrary text the model was trying to write — it can
-    contain coincidental substrings like "413" inside a code comment,
-    which previously caused this function to misreport an unrelated
-    failure (a malformed tool-call JSON) as a request-size/rate-limit
-    issue.
+    Reads the actual HTTP status Groq returned (the SDK always prefixes
+    "Error code: NNN" onto the exception string) instead of scanning the
+    whole error text for keyword substrings — that text can include an
+    echoed 'failed_generation' payload (the model's own attempted tool
+    call output), which is arbitrary content that can coincidentally
+    contain misleading substrings like "413" inside a code comment.
+    Everything below is matched only against the text BEFORE any such
+    echoed payload.
+
+    429/rate_limit_exceeded is further split into two genuinely
+    different problems with different remedies: a single request that
+    was too large for one call (real per-request/context-length case),
+    vs. the day's total token quota being exhausted (TPD) — the latter
+    can't be fixed by narrowing the request, only by waiting or
+    upgrading, so it gets its own message with the actual wait time
+    Groq reported instead of the per-request-size advice.
     """
+    status_match = _ERROR_CODE_RE.search(raw_err)
+    status = status_match.group(1) if status_match else None
     search_region = raw_err.split("failed_generation", 1)[0]
 
     if "tool_use_failed" in search_region:
@@ -97,14 +122,28 @@ def _explain_groq_error(raw_err: str) -> str:
             "output gets malformed along the way. Try asking for a smaller, more "
             "targeted change instead of a full-file rewrite."
         )
-    if "rate_limit_exceeded" in search_region or "413" in search_region:
+
+    if status == "429" and "rate_limit_exceeded" in search_region:
+        wait_str = _format_wait_time(raw_err)
+        if _TPD_RE.search(raw_err):
+            return (
+                f"Today's Groq token quota is nearly used up from everything run in this "
+                f"session so far — not from this request being too big on its own. Groq "
+                f"says it should free up in {wait_str}. You can wait it out, or upgrade to "
+                f"Dev Tier at the link Groq provided if you need to keep working sooner."
+            )
+        return f"Groq's rate limit was hit. It should free up in {wait_str} — try again after that."
+
+    if status == "413" or "context_length_exceeded" in search_region:
         return (
             "The conversation for this task grew too large for the model's "
             "per-request limit — usually caused by several broad searches "
             "or large file reads happening back to back in one turn."
         )
+
     if "timeout" in raw_err.lower():
         return "The request to the model timed out."
+
     return "The underlying model API returned an error."
 
 
@@ -128,6 +167,13 @@ class AetherAgent:
         # Lets a vague follow-up ("fix the bug in it") get resolved without
         # re-sending file content or re-running a full Gemini scan.
         self._recent_files: List[str] = []
+        # True when the MOST RECENT turn was routed through the
+        # chit-chat bypass below. Lets a reply that continues an
+        # already-established small-talk exchange ("im good and you?")
+        # skip the scan too, even though it doesn't match one of the
+        # fixed opening phrases in chitchat_utils — see is_chitchat's
+        # is_continuation param.
+        self._last_turn_was_chitchat: bool = False
 
     def get_tool_definitions(self) -> list[Dict[str, Any]]:
         return [
@@ -291,6 +337,7 @@ class AetherAgent:
         backups / undo stack are untouched — this only clears memory."""
         self.chat_history = []
         self._recent_files = []
+        self._last_turn_was_chitchat = False
         return "Conversation memory cleared."
 
     def _run_lightweight_chat(
@@ -369,8 +416,9 @@ class AetherAgent:
         # deliberately conservative by is_chitchat: any file-extension-
         # looking token or task verb anywhere in the prompt disqualifies
         # it, so a real request is never misrouted here. ---
-        if is_chitchat(user_prompt):
+        if is_chitchat(user_prompt, is_continuation=self._last_turn_was_chitchat):
             log_callback("system", "⚡ Small talk detected — skipping scan and tool loop...")
+            self._last_turn_was_chitchat = True
             return self._run_lightweight_chat(
                 user_prompt,
                 log_callback,
@@ -384,6 +432,8 @@ class AetherAgent:
                 ),
                 cancel_event=cancel_event,
             )
+
+        self._last_turn_was_chitchat = False
 
         tools = self.get_tool_definitions()
 
