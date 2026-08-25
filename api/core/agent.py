@@ -1,5 +1,3 @@
-import json
-import re
 import threading
 from typing import Callable, Dict, Any, Optional, List, Tuple
 from tools.file_manager import SafeFileManager
@@ -8,143 +6,10 @@ from tools.path_utils import find_referenced_files
 from tools.chitchat_utils import is_chitchat
 from providers.gemini_provider import GeminiAnalyzerProvider
 from providers.groq_provider import GroqExecutorProvider
+from core.gemini_tool_loop import explain_gemini_error, run_gemini_tool_loop
+from core.groq_tool_loop import explain_groq_error, is_groq_quota_or_rate_limit, run_groq_tool_loop
 from core.prompt_builder import PromptBuilder
 import config
-
-
-# Turns a raw (tool_name, args) pair into a short, human-readable label for
-# the collapsed tool-call bubble in the UI — e.g. "Read src/pages/index.astro"
-# instead of dumping the full function-call signature. Falls back to the
-# raw tool name for anything unrecognized so a new tool never breaks this.
-def _tool_call_label(name: str, args: Dict[str, Any]) -> str:
-    if name == "read_file":
-        return f"Read {args.get('relative_path', 'file')}"
-    if name == "write_file":
-        return f"Wrote {args.get('relative_path', 'file')}"
-    if name == "delete_file":
-        return f"Deleted {args.get('relative_path', 'file')}"
-    if name == "list_project_files":
-        return "Listed project files"
-    if name == "run_command":
-        return f"Ran: {args.get('command', '')}"
-    if name == "push_changes":
-        return f"Pushed changes: {args.get('commit_message', 'Auto-commit by AetherAgent')}"
-    return name
-
-
-# Rough character budget for the messages list inside ONE tool-loop turn —
-# deliberately conservative relative to Groq's per-request token cap (~4
-# chars/token), leaving headroom for the system prompt and tool schemas,
-# which count against the same limit but aren't included in this count.
-# This is what was missing when a chain of broad `run_command` greps (5
-# approvals across the whole `lib/` dir, in the app_colors.dart incident)
-# kept accumulating INSIDE the same turn — MAX_CHAT_HISTORY_CHARS only
-# bounds what carries over BETWEEN turns, and MAX_TOOL_OUTPUT_CHARS only
-# caps any SINGLE tool result, neither stops several medium-sized results
-# from adding up past Groq's limit within one turn and killing it with a
-# 413 partway through, silently, with no edit applied.
-GROQ_LOOP_CHAR_BUDGET = 24000
-
-
-def _shrink_tool_history_if_needed(messages: list):
-    """
-    Called before every Groq call inside the tool loop. If the accumulated
-    messages are pushing toward Groq's request-size limit, replace the
-    CONTENT of the OLDEST tool-result messages first with a short
-    placeholder — never removes or reorders a message, since the SDK
-    requires every assistant tool_calls entry to still have a matching
-    tool response right after it. Shrinking the earliest results first is
-    deliberate: they're the least relevant to whatever the model is about
-    to do next, and re-calling the tool is cheap if it's still needed.
-    """
-    total = sum(len(m.get("content") or "") for m in messages)
-    if total <= GROQ_LOOP_CHAR_BUDGET:
-        return
-
-    for m in messages:
-        if total <= GROQ_LOOP_CHAR_BUDGET:
-            break
-        if m.get("role") == "tool" and len(m.get("content") or "") > 200:
-            original_len = len(m["content"])
-            total -= original_len
-            m["content"] = (
-                f"[Earlier tool output from this turn trimmed to stay within budget "
-                f"— was {original_len} chars. Call the tool again if you need it.]"
-            )
-            total += len(m["content"])
-
-
-_ERROR_CODE_RE = re.compile(r"Error code:\s*(\d{3})")
-_RETRY_AFTER_RE = re.compile(r"try again in (?:([0-9]+)m)?([0-9.]+)s")
-_TPD_RE = re.compile(r"tokens per day \(TPD\)")
-
-
-def _format_wait_time(raw_err: str) -> str:
-    match = _RETRY_AFTER_RE.search(raw_err)
-    if not match:
-        return "a short while"
-    minutes_part, seconds_part = match.groups()
-    minutes = int(minutes_part) if minutes_part else 0
-    seconds = int(float(seconds_part))
-    return f"about {minutes}m {seconds}s" if minutes else f"about {seconds}s"
-
-
-def _explain_groq_error(raw_err: str) -> str:
-    """
-    Turns a raw Groq/httpx exception string into one plain-language
-    sentence for the user-facing failure message in _run_groq_tool_loop.
-
-    Reads the actual HTTP status Groq returned (the SDK always prefixes
-    "Error code: NNN" onto the exception string) instead of scanning the
-    whole error text for keyword substrings — that text can include an
-    echoed 'failed_generation' payload (the model's own attempted tool
-    call output), which is arbitrary content that can coincidentally
-    contain misleading substrings like "413" inside a code comment.
-    Everything below is matched only against the text BEFORE any such
-    echoed payload.
-
-    429/rate_limit_exceeded is further split into two genuinely
-    different problems with different remedies: a single request that
-    was too large for one call (real per-request/context-length case),
-    vs. the day's total token quota being exhausted (TPD) — the latter
-    can't be fixed by narrowing the request, only by waiting or
-    upgrading, so it gets its own message with the actual wait time
-    Groq reported instead of the per-request-size advice.
-    """
-    status_match = _ERROR_CODE_RE.search(raw_err)
-    status = status_match.group(1) if status_match else None
-    search_region = raw_err.split("failed_generation", 1)[0]
-
-    if "tool_use_failed" in search_region:
-        return (
-            "The model generated an invalid tool call — this usually happens when it "
-            "tries to write or rewrite a very large file in a single step and the "
-            "output gets malformed along the way. Try asking for a smaller, more "
-            "targeted change instead of a full-file rewrite."
-        )
-
-    if status == "429" and "rate_limit_exceeded" in search_region:
-        wait_str = _format_wait_time(raw_err)
-        if _TPD_RE.search(raw_err):
-            return (
-                f"Today's Groq token quota is nearly used up from everything run in this "
-                f"session so far — not from this request being too big on its own. Groq "
-                f"says it should free up in {wait_str}. You can wait it out, or upgrade to "
-                f"Dev Tier at the link Groq provided if you need to keep working sooner."
-            )
-        return f"Groq's rate limit was hit. It should free up in {wait_str} — try again after that."
-
-    if status == "413" or "context_length_exceeded" in search_region:
-        return (
-            "The conversation for this task grew too large for the model's "
-            "per-request limit — usually caused by several broad searches "
-            "or large file reads happening back to back in one turn."
-        )
-
-    if "timeout" in raw_err.lower():
-        return "The request to the model timed out."
-
-    return "The underlying model API returned an error."
 
 
 class AetherAgent:
@@ -427,7 +292,9 @@ class AetherAgent:
                     "directory is linked for this session, but the user's current "
                     "message is just small talk and doesn't require touching the "
                     "project — respond naturally and briefly, without mentioning "
-                    "files, scans, or tools. This is a continuous conversation — use "
+                    "files, scans, or tools. You cannot inspect files, change files, "
+                    "run commands, commit, or push from this no-tools chat path, so "
+                    "never claim you did any of those things. This is a continuous conversation — use "
                     "the earlier turns below for context."
                 ),
                 cancel_event=cancel_event,
@@ -501,12 +368,12 @@ class AetherAgent:
             )
 
         messages = [
-            {"role": "system", "content": PromptBuilder.get_groq_system_instruction()},
+            {"role": "system", "content": PromptBuilder.get_executor_system_instruction()},
             *self._get_history_window(),
             {"role": "user", "content": user_content}
         ]
 
-        final_answer = self._run_groq_tool_loop(
+        final_answer = self._run_executor_tool_loop(
             messages, tools, log_callback, command_approval_callback, cancel_event=cancel_event
         )
 
@@ -521,7 +388,7 @@ class AetherAgent:
         self._append_turn(user_prompt, final_answer)
         return final_answer
 
-    def _run_groq_tool_loop(
+    def _run_executor_tool_loop(
         self,
         messages: list,
         tools: list,
@@ -529,86 +396,58 @@ class AetherAgent:
         command_approval_callback: Optional[Callable[[str], bool]],
         cancel_event: Optional[threading.Event] = None,
     ) -> str:
-        max_turns = 10
-        for _ in range(max_turns):
-            # Checked at the top of every iteration. This is what actually
-            # stops a turn that's already been declared timed-out (in
-            # api.py) from making another Groq call, running another tool,
-            # or firing another approval request — the worker thread this
-            # runs on can't be force-killed once asyncio.wait_for()'s
-            # timeout fires on the other end, so this cooperative check is
-            # what makes cancellation take effect.
+        groq_result = run_groq_tool_loop(
+            self.groq_provider,
+            messages,
+            tools,
+            log_callback,
+            self._execute_tool,
+            command_approval_callback,
+            cancel_event=cancel_event,
+        )
+        if groq_result.ok:
+            return groq_result.final_answer
+
+        raw_err = groq_result.provider_error or ""
+        if cancel_event is not None and cancel_event.is_set():
+            return ""
+
+        if is_groq_quota_or_rate_limit(raw_err):
+            log_callback(
+                "system",
+                "⚠️ Groq hit a quota/rate limit mid-task. Continuing the same task with Gemini...",
+            )
+            gemini_result = run_gemini_tool_loop(
+                self.gemini_provider,
+                groq_result.messages or messages,
+                tools,
+                log_callback,
+                self._execute_tool,
+                command_approval_callback,
+                cancel_event=cancel_event,
+            )
+            if gemini_result.ok:
+                return gemini_result.final_answer
+
             if cancel_event is not None and cancel_event.is_set():
                 return ""
 
-            _shrink_tool_history_if_needed(messages)
+            friendly = (
+                "⚠️ I switched from Groq to Gemini after Groq hit a quota/rate limit, "
+                "but Gemini could not finish the continuation. "
+                f"{explain_gemini_error(gemini_result.provider_error or '')} "
+                "Any changes already completed remain on disk; try again after the "
+                "provider limit clears, or narrow the request if it touches a lot of code."
+            )
+            log_callback("ai", friendly)
+            return friendly
 
-            try:
-                response_msg = self.groq_provider.client.chat.completions.create(
-                    model=self.groq_provider.model_name,
-                    messages=messages,
-                    tools=tools,
-                    tool_choice="auto",
-                    temperature=0.1
-                ).choices[0].message
-            except Exception as e:
-                if cancel_event is not None and cancel_event.is_set():
-                    return ""
-
-                raw_err = str(e)
-                # Full raw error still goes to the collapsed "system" lane,
-                # for debugging — but it's no longer the ONLY thing the
-                # user sees when a task dies mid-way.
-                log_callback("system", f"❌ Groq API Error: {raw_err}")
-
-                friendly = (
-                    "⚠️ I hit an error partway through this task and had to stop — "
-                    "**no changes were made to your files.** "
-                    f"{_explain_groq_error(raw_err)} "
-                    "You can try again — if the request touches a lot of code, "
-                    "narrowing it to the specific file or values usually helps."
-                )
-                log_callback("ai", friendly)
-                return friendly
-
-            # The SDK returns a pydantic model, not a dict. Appending it raw
-            # breaks the next request in this loop (and any retry) — the
-            # OpenAI-compatible client needs plain dicts in `messages`.
-            messages.append(response_msg.model_dump(exclude_none=True))
-
-            if response_msg.tool_calls:
-                for tool_call in response_msg.tool_calls:
-                    if cancel_event is not None and cancel_event.is_set():
-                        return ""
-
-                    fn_name = tool_call.function.name
-                    try:
-                        fn_args = json.loads(tool_call.function.arguments)
-                    except Exception:
-                        fn_args = {}
-
-                    tool_result = self._execute_tool(fn_name, fn_args, command_approval_callback)
-
-                    # Sent as its own "tool" role instead of two raw "system"
-                    # lines — the frontend collapses this into a one-line,
-                    # click-to-expand bubble (see ToolCallBlock in page.tsx)
-                    # instead of dumping the full result (e.g. a 60-file
-                    # list_project_files listing) straight into the
-                    # transcript. Groq still gets the full, untruncated
-                    # tool_result below — this only changes what streams to
-                    # the UI, not what the model sees.
-                    log_callback("tool", json.dumps({
-                        "tool": fn_name,
-                        "label": _tool_call_label(fn_name, fn_args),
-                        "result": tool_result,
-                    }))
-
-                    messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": tool_result})
-            else:
-                final_answer = response_msg.content or "Task completed successfully."
-                if cancel_event is not None and cancel_event.is_set():
-                    return ""
-                log_callback("ai", final_answer)
-                return final_answer
-
-        return "Agent reached maximum tool turns without concluding."
+        friendly = (
+            "⚠️ I hit an error partway through this task and had to stop. "
+            f"{explain_groq_error(raw_err)} "
+            "Any changes already completed remain on disk. You can try again - if the "
+            "request touches a lot of code, narrowing it to the specific file or values "
+            "usually helps."
+        )
+        log_callback("ai", friendly)
+        return friendly

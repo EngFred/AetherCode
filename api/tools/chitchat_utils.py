@@ -27,7 +27,8 @@ _CODE_SIGNAL_PATTERN = re.compile(
     r"\.[a-zA-Z0-9]{1,6}\b"  # looks like a filename/extension
     r"|\b(fix|bug|error|implement|refactor|add|create|delete|remove|"
     r"update|run|test|build|debug|install|deploy|write|read|analyze|"
-    r"scan|generate|check|review|change|edit)\b",
+    r"scan|generate|check|review|change|edit|git|stage|commit|push|"
+    r"pull|merge|branch|checkout|status|diff|stash|rebase|tag|publish)\b",
     re.IGNORECASE,
 )
 
