@@ -119,9 +119,11 @@ async def chat_endpoint(websocket: WebSocket):
                 root_dir=target_dir,
                 gemini_key=config.GEMINI_API_KEY,
                 groq_key=config.GROQ_API_KEY,
-                cerebras_key=config.CEREBRAS_API_KEY,
+                mistral_key=config.MISTRAL_API_KEY,
+                openrouter_key=config.OPENROUTER_API_KEY,
             )
             current_working_dir = target_dir
+
 
         # Cancellation signal scoped to THIS turn only — fresh Event every
         # call, never reused. Set the moment this turn's timeout fires,

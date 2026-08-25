@@ -179,8 +179,8 @@ def run_gemini_tool_loop(
                     system_instruction=system_instruction,
                     temperature=0.1,
                     tools=[gemini_tool],
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                 ),
+
             )
         except Exception as e:
             if is_cancelled(cancel_event):

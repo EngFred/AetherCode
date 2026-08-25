@@ -1,11 +1,9 @@
 import re
-
 import config
 
 # Any request text gets normalized (trimmed, lowercased, apostrophes
 # stripped, trailing punctuation stripped, whitespace collapsed) before
-# being checked against this set. Add new greetings/acknowledgements here
-# in their normalized form — no apostrophes, no trailing punctuation.
+# being checked against this set.
 _CHITCHAT_PHRASES = {
     "hi", "hey", "hello", "yo", "sup", "howdy", "hiya", "heya",
     "hi there", "hey there", "hello there",
@@ -17,18 +15,24 @@ _CHITCHAT_PHRASES = {
     "ok", "okay", "cool", "nice", "great", "awesome", "got it",
     "sounds good", "perfect", "nice one", "makes sense",
     "bye", "goodbye", "see ya", "see you", "later",
+    # Common conversational replies:
+    "im good", "i am good", "im fine", "i am fine", "im ok", "i am ok",
+    "doing good", "doing well", "doing fine", "doing great",
+    "all good", "pretty good", "not bad", "not much", "nothing much",
+    "good you", "good and you", "im good you", "im good and you",
+    "you too", "same here", "same to you", "no worries", "no problem",
 }
 
-# Any of these tokens anywhere in the raw message disqualifies it from
-# being chit-chat, regardless of how the message opens — a greeting can
-# be the first few words of a real task ("hey, can you fix login.py"),
-# and that must never get routed through the no-tools bypass.
-_CODE_SIGNAL_PATTERN = re.compile(
-    r"\.[a-zA-Z0-9]{1,6}\b"  # looks like a filename/extension
+# Any of these tokens anywhere in the message immediately disqualifies it from
+# being chit-chat — even if it opens with a greeting like "hey can you fix..."
+_TASK_OR_PROJECT_SIGNAL_PATTERN = re.compile(
+    r"\.[a-zA-Z0-9]{1,6}\b"  # looks like a filename/extension (e.g. .py, .ts, .dart)
     r"|\b(fix|bug|error|implement|refactor|add|create|delete|remove|"
     r"update|run|test|build|debug|install|deploy|write|read|analyze|"
     r"scan|generate|check|review|change|edit|git|stage|commit|push|"
-    r"pull|merge|branch|checkout|status|diff|stash|rebase|tag|publish)\b",
+    r"pull|merge|branch|checkout|status|diff|stash|rebase|tag|publish|"
+    r"project|code|files?|folders?|dirs?|directory|contents?|list|show|"
+    r"inspect)\b",
     re.IGNORECASE,
 )
 
@@ -46,40 +50,18 @@ def _normalize(text: str) -> str:
 
 def is_chitchat(prompt: str, is_continuation: bool = False) -> bool:
     """
-    True only for turns that plainly need no project context at all —
-    greetings, thanks, acknowledgements. Used by AetherAgent.run() to skip
-    the Gemini directory scan + full Groq tool loop for a linked project
-    when the message is obviously small talk, instead of running the
-    whole pipeline just to produce "Hey! How can I help?".
-
-    Deliberately conservative in both directions:
-    - length-capped and (for a NEW small-talk exchange) exact-phrase-
-      matched, so it only fires on messages that plainly ARE one of
-      these things, not ones that merely start with one;
-    - any file-extension-looking token or task verb anywhere in the
-      message disqualifies it outright, always — this check runs
-      regardless of is_continuation.
-
-    is_continuation: pass True when the immediately preceding turn in
-    this session was ALSO routed through this bypass. A reply that's
-    plainly continuing an already-established small-talk exchange
-    (e.g. "im good and you?" replying to the agent's own "how's your
-    day going?") won't ever match something from the fixed
-    _CHITCHAT_PHRASES list, and no fixed list ever could — there's no
-    way to enumerate every phrasing of a conversational reply. Once a
-    continuation, it only needs to still pass the length cap and the
-    code-signal check to qualify; exact-phrase matching is reserved for
-    OPENING a chit-chat exchange, where nothing else yet confirms intent.
-
-    A false negative here just costs an extra scan (safe). A false
-    positive would silently skip a real request (not safe) — so the bar
-    to return True is high on purpose.
+    Returns True ONLY for pure small talk / greetings / acknowledgements.
+    
+    Any request containing project keywords, file inquiries, task verbs,
+    or questions immediately routes through to the full agent pipeline.
     """
     raw = prompt.strip()
     if not raw or len(raw) > config.MAX_CHITCHAT_CHARS:
         return False
-    if _CODE_SIGNAL_PATTERN.search(raw):
+
+    # Disqualify if it has any coding or project task signal (e.g. "hey fix main.py")
+    if _TASK_OR_PROJECT_SIGNAL_PATTERN.search(raw):
         return False
-    if is_continuation:
-        return True
-    return _normalize(raw) in _CHITCHAT_PHRASES
+
+    norm = _normalize(raw)
+    return norm in _CHITCHAT_PHRASES

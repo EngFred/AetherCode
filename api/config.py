@@ -7,14 +7,19 @@ load_dotenv()
 # --- API KEYS ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "PLACEHOLDER_GROQ_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "PLACEHOLDER_GEMINI_KEY")
-CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "PLACEHOLDER_CEREBRAS_KEY")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "PLACEHOLDER_MISTRAL_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "PLACEHOLDER_OPENROUTER_KEY")
 
 # --- MODEL DEFINITIONS ---
 GROQ_EXECUTOR_MODEL = "openai/gpt-oss-120b"
-GEMINI_ANALYZER_MODEL = "gemini-3.5-flash"
-# llama-3.3-70b is the strongest free tool-calling model on Cerebras.
-# It is fully OpenAI-compatible and resets at 1M tokens / day.
-CEREBRAS_EXECUTOR_MODEL = "llama-3.3-70b"
+# gemini-3.6-flash is Google's active recommended flash model
+GEMINI_ANALYZER_MODEL = "gemini-3.6-flash"
+# mistral-small-latest has permanent free Experiment tier with full function calling
+MISTRAL_EXECUTOR_MODEL = "mistral-small-latest"
+# OpenRouter free tier model with tool-calling capabilities (resets daily)
+OPENROUTER_EXECUTOR_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+
+
 
 # --- CORS ---
 # Comma-separated list in the env var, e.g. "http://localhost:3000,app://."
@@ -89,9 +94,8 @@ MAX_RECENT_FILES_TRACKED = 8      # filenames (not content) carried forward acro
 # A slow or hung call raises inside the existing try/except in the tool
 # loops instead of blocking the worker thread indefinitely.
 GROQ_REQUEST_TIMEOUT_SECONDS = 60
-# Cerebras is typically very fast (WSE hardware), but keep the same ceiling
-# so agentic tool-loop turns with many sequential calls are still bounded.
-CEREBRAS_REQUEST_TIMEOUT_SECONDS = 60
+PROVIDER_REQUEST_TIMEOUT_SECONDS = 60
+
 
 # Hard ceiling for one full agent.run() turn — covers the Gemini scan AND
 # the whole Groq tool loop. This is a connection-level safety net: it
